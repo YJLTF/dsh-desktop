@@ -22,12 +22,12 @@ async fn installed_version(resolution: &Resolution) -> Option<String> {
         Resolution::NotFound { .. } => return None,
     };
 
-    let output = tokio::process::Command::new(&program)
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args).stdin(std::process::Stdio::null());
+    // 安装版为 GUI 子系统，运行 `dsh --version` 也会弹出 node.exe 终端窗口，需显式隐藏。
+    #[cfg(windows)]
+    cmd.creation_flags(process::CREATE_NO_WINDOW);
+    let output = cmd.output().await.ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
     let v = text.trim().split_whitespace().next()?;

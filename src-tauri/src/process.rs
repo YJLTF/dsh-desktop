@@ -6,7 +6,15 @@ use tauri::{AppHandle, Emitter};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use crate::settings;
+
+/// Windows 下 CREATE_NO_WINDOW 标志：GUI 应用拉起控制台程序（node.exe、npm.cmd 等）时
+/// 不为其新建终端窗口，否则安装版每次启动 dsh 都会弹出 node.exe 控制台。
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// dsh 入口的解析方式。
 #[derive(Debug, Clone, Serialize)]
@@ -109,7 +117,11 @@ fn script_in_node_modules(node_modules_dir: &Path) -> Option<PathBuf> {
 
 /// 通过 `npm root -g` 解析全局 node_modules 根目录。
 fn global_node_modules() -> Option<PathBuf> {
-    let out = std::process::Command::new(npm_exe()?).args(["root", "-g"]).output().ok()?;
+    let mut cmd = std::process::Command::new(npm_exe()?);
+    cmd.args(["root", "-g"]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -288,10 +300,11 @@ async fn cleanup_stale_port_owner(port: u16) {
     use std::process::Command as StdCommand;
 
     // 通过 netstat 找到监听该端口的 PID。
-    let Ok(out) = StdCommand::new("netstat")
-        .args(["-ano", "-p", "tcp"])
-        .output()
-    else {
+    let mut netstat = StdCommand::new("netstat");
+    netstat.args(["-ano", "-p", "tcp"]);
+    #[cfg(windows)]
+    netstat.creation_flags(CREATE_NO_WINDOW);
+    let Ok(out) = netstat.output() else {
         return;
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -323,10 +336,11 @@ async fn cleanup_stale_port_owner(port: u16) {
 fn kill_if_node(pid: &str) -> bool {
     use std::process::Command as StdCommand;
 
-    let Ok(out) = StdCommand::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-    else {
+    let mut tasklist = StdCommand::new("tasklist");
+    tasklist.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    #[cfg(windows)]
+    tasklist.creation_flags(CREATE_NO_WINDOW);
+    let Ok(out) = tasklist.output() else {
         return false;
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -337,8 +351,11 @@ fn kill_if_node(pid: &str) -> bool {
     if !first_line.to_lowercase().starts_with("\"node") {
         return false;
     }
-    StdCommand::new("taskkill")
-        .args(["/F", "/PID", pid])
+    let mut taskkill = StdCommand::new("taskkill");
+    taskkill.args(["/F", "/PID", pid]);
+    #[cfg(windows)]
+    taskkill.creation_flags(CREATE_NO_WINDOW);
+    taskkill
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -400,6 +417,10 @@ pub async fn start_dsh(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+
+    // 安装版为 GUI 子系统，需显式加 CREATE_NO_WINDOW，否则会弹出 node.exe 终端窗口。
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
     // 清理上次会话遗留的 dsh 孤儿进程，避免端口冲突导致新子进程静默退出。
     #[cfg(windows)]
