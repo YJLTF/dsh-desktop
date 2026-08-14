@@ -93,6 +93,8 @@ pub async fn open_harness_window_checked(handle: &AppHandle) {
         if needs_nav {
             let _ = w.eval(&format!("window.location.href = '{dsh_url}';"));
         }
+        // Windows 上最小化的窗口 show() 是空操作，须先 unminimize 才能还原。
+        let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
         minimize_control_panel(handle);

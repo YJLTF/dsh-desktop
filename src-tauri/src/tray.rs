@@ -60,6 +60,7 @@ pub fn build_tray(app: &App) {
         }
         "show-panel" => {
             if let Some(w) = app.get_webview_window("control-panel") {
+                let _ = w.unminimize();
                 let _ = w.show();
                 let _ = w.set_focus();
             }
