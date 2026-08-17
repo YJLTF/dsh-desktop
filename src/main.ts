@@ -175,6 +175,9 @@ function renderProxy(info: ProxyInfo) {
   const box = document.getElementById("proxy-url-box")!;
   if (info.running && info.url) {
     box.innerHTML = `<span id="proxy-url">${info.url}<span id="token-suffix"></span></span><span class="copy" id="copy-url" title="复制完整链接">⧉</span>`;
+  } else if (info.running) {
+    // 代理已启动但未能确定局域网 IP（常见于无外网路由的纯内网环境）。
+    box.innerHTML = `<span id="proxy-url">已启用（端口 ${info.port}），但未能确定局域网 IP；可在其他设备访问 http://&lt;本机IP&gt;:${info.port}/?token=&lt;令牌&gt;</span>`;
   } else {
     box.innerHTML = `<span class="off">代理未启用</span>`;
   }
@@ -248,8 +251,14 @@ async function saveSettings() {
 async function toggleProxy(on: boolean) {
   try {
     if (on) {
-      await invoke("start_proxy");
-      toast("局域网代理已启用");
+      const info = await invoke<ProxyInfo>("start_proxy");
+      renderProxy(info);
+      if (settings && info.port !== settings.lan_proxy_port) {
+        // 配置端口不可用（如 Win10 Hyper-V/WSL 保留端口段），后端已回退为系统分配端口。
+        toast(`端口 ${settings.lan_proxy_port} 不可用，已改用端口 ${info.port}`);
+      } else {
+        toast("局域网代理已启用");
+      }
     } else {
       await invoke("stop_proxy");
       toast("局域网代理已关闭");

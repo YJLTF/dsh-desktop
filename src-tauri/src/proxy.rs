@@ -7,7 +7,7 @@ use axum::routing::any;
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use std::net::UdpSocket;
+use std::net::{IpAddr, ToSocketAddrs, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -47,6 +47,8 @@ struct ProxyState {
 pub struct ProxyRuntime {
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     join: Mutex<Option<JoinHandle<()>>>,
+    /// 实际监听的端口（配置端口被占用时会回退为系统分配端口，须记住真实值）。
+    port: Mutex<Option<u16>>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -58,11 +60,46 @@ pub struct ProxyInfo {
     pub url: Option<String>,
 }
 
+/// 判断是否为可用于局域网通信的 IPv4 地址（排除环回、链路本地与未指定地址）。
+fn is_lan_ipv4(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(_) => false,
+    }
+}
+
 /// 在不发送任何数据包的情况下探测面向局域网的 IPv4 地址。
+/// 优先借助默认路由（UDP connect 只选路由不发包）；依次尝试多个公共 DNS，
+/// 全部不可达时（纯内网、无外网路由的 Win10 环境）回退为主机名解析。
 pub fn lan_ip() -> Option<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    socket.local_addr().ok().map(|a| a.ip().to_string())
+    for target in ["8.8.8.8:80", "114.114.114.114:80", "1.1.1.1:53"] {
+        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+        if let Ok(addr) = socket.local_addr() {
+            let ip = addr.ip();
+            if is_lan_ipv4(&ip) {
+                return Some(ip.to_string());
+            }
+        }
+    }
+    lan_ip_from_hostname()
+}
+
+/// 离线内网的兜底：解析主机名得到本机网卡上的局域网 IPv4。
+/// Windows 上 getaddrinfo 通常能将 NetBIOS 计算机名解析为本机 IP。
+fn lan_ip_from_hostname() -> Option<String> {
+    let hostname = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()?;
+    let addrs = (hostname.as_str(), 0).to_socket_addrs().ok()?;
+    addrs
+        .map(|a| a.ip())
+        .find(|ip| is_lan_ipv4(ip))
+        .map(|ip| ip.to_string())
 }
 
 fn copy_headers(src: &reqwest::header::HeaderMap, dest: &mut axum::http::HeaderMap) {
@@ -319,6 +356,29 @@ fn emit_proxy_info(handle: &AppHandle, running: bool, port: u16) {
     let _ = handle.emit("proxy-info", current_info(running, port));
 }
 
+/// 绑定代理监听端口；配置端口绑定失败时自动回退到系统分配的临时端口。
+/// Windows 10 上 Hyper-V / WSL2 / VPN 客户端会随机保留若干连续端口段（重启后还会变化），
+/// 配置端口落入保留段时 bind 会以 WSAEACCES(10013) 失败：端口看似空闲却无法监听，
+/// 表现为“局域网代理无法启动”。先重试一次排除偶发竞争，仍失败则回退临时端口保证可用。
+async fn bind_listener(port: u16) -> std::io::Result<(TcpListener, u16)> {
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 1..=2 {
+        match TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(listener) => return Ok((listener, port)),
+            Err(e) => {
+                log::warn!("绑定代理端口 {port} 失败（第 {attempt} 次）：{e}");
+                last_err = Some(e);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let listener = TcpListener::bind(("0.0.0.0", 0)).await.map_err(|_| {
+        last_err.unwrap_or_else(|| std::io::Error::other("绑定临时端口失败"))
+    })?;
+    let bound = listener.local_addr()?.port();
+    Ok((listener, bound))
+}
+
 /// 在 `0.0.0.0:port` 上启动局域网代理服务。
 #[tauri::command]
 pub async fn start_proxy(
@@ -341,10 +401,16 @@ pub async fn start_proxy(
             .map_err(|e| format!("代理客户端构建失败：{e}"))?,
     };
 
-    let listener = TcpListener::bind(("0.0.0.0", port))
+    let (listener, bound_port) = bind_listener(port)
         .await
         .map_err(|e| format!("绑定代理端口 {port} 失败：{e}"))?;
-    let bound_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    if bound_port != port {
+        log::warn!(
+            "代理端口 {port} 不可用（Windows 10 上常见原因：Hyper-V/WSL/VPN 保留了该端口段，可用 netsh interface ipv4 show excludedportrange protocol=tcp 查询），已回退为系统分配端口 {bound_port}"
+        );
+    }
+
+    *runtime.port.lock().await = Some(bound_port);
 
     let (tx, rx) = oneshot::channel::<()>();
     {
@@ -378,6 +444,7 @@ async fn stop_inner(runtime: &ProxyRuntime) {
     if let Some(handle) = runtime.join.lock().await.take() {
         let _ = handle.await;
     }
+    *runtime.port.lock().await = None;
 }
 
 /// 停止局域网代理服务。
@@ -399,8 +466,11 @@ pub async fn get_proxy_info(
     runtime: tauri::State<'_, ProxyRuntime>,
 ) -> Result<ProxyInfo, String> {
     let running = runtime.shutdown.lock().await.is_some();
+    let bound = *runtime.port.lock().await;
     let s = settings::current(&handle);
-    Ok(current_info(running, s.lan_proxy_port))
+    // 运行中优先回报实际监听端口（可能因回退与配置端口不同）。
+    let port = if running { bound.unwrap_or(s.lan_proxy_port) } else { s.lan_proxy_port };
+    Ok(current_info(running, port))
 }
 
 /// 返回访问令牌（供界面展示，便于用户复制分享链接）。

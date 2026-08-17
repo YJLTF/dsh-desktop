@@ -115,7 +115,8 @@ fn script_in_node_modules(node_modules_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// 通过 `npm root -g` 解析全局 node_modules 根目录。
+/// 通过 `npm root -g` 解析全局 node_modules 根目录（动态查询，跟随 npm prefix 变化，
+/// 不写死路径）。这是默认路径检查的首选方式。
 fn global_node_modules() -> Option<PathBuf> {
     let mut cmd = std::process::Command::new(npm_exe()?);
     cmd.args(["root", "-g"]);
@@ -125,21 +126,69 @@ fn global_node_modules() -> Option<PathBuf> {
     if !out.status.success() {
         return None;
     }
+    // npm 偶尔会在 stdout 混入通知行；路径始终在最后一个非空行上。
     let text = String::from_utf8_lossy(&out.stdout);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
-    }
+    let line = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .last()?;
+    Some(PathBuf::from(line))
 }
 
 fn node_exe() -> Option<PathBuf> {
     which::which("node").ok().or_else(|| which::which("node.exe").ok())
 }
 
+/// 在 node 可执行文件同目录下查找的 npm 文件名。Windows 上 node 目录同时附带
+/// 无扩展名的 npm（sh 脚本，CreateProcess 无法直接运行），必须优先检查 npm.cmd。
+#[cfg(windows)]
+const NPM_FILES: &[&str] = &["npm.cmd"];
+#[cfg(not(windows))]
+const NPM_FILES: &[&str] = &["npm"];
+
+/// 解析 npm 可执行文件路径。GUI 子系统应用继承自 Shell 的 PATH 可能缺失用户级 npm
+/// 目录（Win10 上“已安装全局包却找不到 dsh”的常见原因）：优先用 node 同目录的 npm，
+/// 再查 PATH，最后回退到 npm 用户级前缀（Windows 为 %APPDATA%\npm，由环境变量推导）。
 fn npm_exe() -> Option<PathBuf> {
-    which::which("npm").ok().or_else(|| which::which("npm.cmd").ok())
+    if let Some(node) = node_exe() {
+        if let Some(dir) = node.parent() {
+            for name in NPM_FILES {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    for name in NPM_FILES {
+        if let Ok(found) = which::which(name) {
+            return Some(found);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let candidate = PathBuf::from(appdata).join("npm").join("npm.cmd");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// npm 不可用（找不到 / 执行失败）时的兜底：由环境变量推导全局 node_modules 目录。
+/// Windows 上 npm 默认全局前缀为 %APPDATA%\npm，其 node_modules 子目录即全局包目录。
+/// 这是基于 npm 约定 + 环境变量的推导，而非写死机器特定路径。
+fn global_node_modules_fallback() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var_os("APPDATA")?;
+        let dir = PathBuf::from(appdata).join("npm").join("node_modules");
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// 校验自定义 dsh 路径，返回需要向用户提示的警告信息（None 表示无问题）。
@@ -207,8 +256,10 @@ pub async fn resolve_dsh(custom: &Option<String>) -> Resolution {
             }
         }
 
-        // 3. 全局 node_modules（npm root -g 返回的路径本身就是 node_modules 目录）。
-        if let Some(root) = global_node_modules() {
+        // 3. 全局 node_modules：首选 `npm root -g` 动态解析（自动跟随 npm prefix，
+        //    含用户自定义 prefix）；npm 不可用时回退到由环境变量推导的默认全局目录。
+        let global_root = global_node_modules().or_else(global_node_modules_fallback);
+        if let Some(root) = global_root {
             if let Some(script) = script_in_node_modules(&root) {
                 return Resolution::Node {
                     node: node.to_string_lossy().into_owned(),
