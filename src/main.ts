@@ -271,8 +271,15 @@ function renderVersion(v: VersionInfo) {
   if (ver && v.installed) ver.textContent = `dsh v${v.installed}`;
 }
 
+/// 上次渲染时的自定义路径；变化时才重新解析入口来源（解析可能触发 npm root -g）。
+let lastCustomPath: string | null | undefined = undefined;
+
 function renderSettings(s: Settings) {
   settings = s;
+  if (lastCustomPath === undefined || s.dsh_custom_path !== lastCustomPath) {
+    lastCustomPath = s.dsh_custom_path;
+    refreshResolution();
+  }
   (document.getElementById("dsh-path") as HTMLInputElement).value = s.dsh_custom_path ?? "";
   (document.getElementById("proxy-port") as HTMLInputElement).value = String(s.lan_proxy_port);
   renderToken(s.lan_proxy_token);
@@ -289,6 +296,17 @@ function renderToken(token: string) {
   const el = document.getElementById("proxy-token")!;
   el.textContent = token ? `${token.slice(0, 8)}…${token.slice(-4)}` : "—";
   el.title = token ? `${token}（点击复制）` : "";
+}
+
+/// 刷新 dsh 入口来源显示（全局安装 / 本地安装 / 自定义路径 / 未找到）。
+/// 后端在 dsh 未运行时会按当前设置实时解析（可能涉及 npm root -g，秒级），
+/// 因此调用处不 await，避免阻塞页面初始化与事件绑定。
+async function refreshResolution() {
+  try {
+    const r = await invoke<Resolution>("get_resolution");
+    const src = document.getElementById("dsh-source");
+    if (src) src.textContent = r.kind === "NotFound" ? "未找到 dsh" : r.source;
+  } catch { /* 忽略 */ }
 }
 
 /// 校验自定义 dsh 路径输入框当前内容，并在输入框下方展示警告（无问题则隐藏）。
@@ -379,15 +397,12 @@ async function init() {
   }
   try { renderDshStatus(await invoke<DshStatus>("get_dsh_status")); } catch { /* 忽略 */ }
   try { renderProxy(await invoke<ProxyInfo>("get_proxy_info")); } catch { /* 忽略 */ }
-  // dsh 入口来源（全局安装 / 本地安装 / 自定义路径 / 未找到）。
-  try {
-    const r = await invoke<Resolution>("get_resolution");
-    const src = document.getElementById("dsh-source");
-    if (src) src.textContent = r.kind === "NotFound" ? "未找到 dsh" : r.source;
-  } catch { /* 忽略 */ }
 
   bindEvents();
   await listenEvents();
+
+  // dsh 入口来源：后端可能需实时解析（npm root -g 秒级），异步刷新不阻塞初始化。
+  refreshResolution();
 
   // 每隔几秒轮询 dsh 状态，以便捕获进程意外退出。
   setInterval(async () => {

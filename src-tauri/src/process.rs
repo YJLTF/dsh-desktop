@@ -598,11 +598,22 @@ pub async fn get_dsh_status(
 }
 
 /// 返回 dsh 的解析方式（供界面展示）。
+/// dsh 运行中回报启动时实际使用的解析结果（最准确）；否则按当前设置实时解析。
+/// 不能只读缓存：缓存在 start_dsh 时才写入，应用启动、面板先于 dsh 拉起加载时
+/// 缓存还是 NotFound 默认值，会误显示“未找到 dsh”（版本号却正常显示）。
 #[tauri::command]
 pub async fn get_resolution(
+    handle: AppHandle,
     state: tauri::State<'_, DshState>,
 ) -> Result<Resolution, String> {
-    Ok(state.resolution().await)
+    if state.is_running() {
+        let cached = state.resolution().await;
+        if !matches!(cached, Resolution::NotFound { .. }) {
+            return Ok(cached);
+        }
+    }
+    let settings = settings::current(&handle);
+    Ok(resolve_dsh(&settings.dsh_custom_path).await)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
