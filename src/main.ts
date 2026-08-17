@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen } from "@tauri-apps/api/event";
 
 interface Settings {
   minimize_to_tray: boolean;
@@ -9,6 +9,8 @@ interface Settings {
   lan_proxy_enabled: boolean;
   lan_proxy_port: number;
   lan_proxy_token: string;
+  firewall_hint_shown: boolean;
+  auto_launch_app: boolean;
   dsh_custom_path: string | null;
   dsh_host: string;
   dsh_port: number;
@@ -32,6 +34,32 @@ interface VersionInfo {
   installed: string | null;
   latest: string | null;
   update_available: boolean;
+}
+
+type Resolution =
+  | { kind: "Node"; node: string; script: string; source: string }
+  | { kind: "Executable"; exe: string; source: string }
+  | { kind: "NotFound"; message: string };
+
+/// 转义进 innerHTML 模板的动态文本（版本号等来自外部数据源）。
+function esc(s: string | number | null | undefined): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" } as Record<string, string>)[c]
+  );
+}
+
+/// 将端口钳制到 1024–65535（越界值会导致后端 serde 反序列化失败，所有设置都保存不了）。
+function clampPort(value: string, fallback: number): number {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(65535, Math.max(1024, Math.round(n)));
+}
+
+/// 将小时数钳制到 1–168。
+function clampHours(value: string, fallback: number): number {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(168, Math.max(1, Math.round(n)));
 }
 
 let settings: Settings | null = null;
@@ -88,6 +116,13 @@ function buildApp(): HTMLElement {
         </div>
         <div class="row" style="margin-top:12px">
           <div>
+            <div class="label">版本信息</div>
+            <div class="desc" id="dsh-version">dsh v—</div>
+          </div>
+          <span class="muted" id="dsh-source" style="font-size:11px"></span>
+        </div>
+        <div class="row" style="margin-top:12px">
+          <div>
             <div class="label">自定义 dsh 路径</div>
             <div class="desc">选择入口文件（bin.js / 可执行文件）；留空则自动查找已安装的 @deepseek-ai/dsh</div>
           </div>
@@ -102,9 +137,12 @@ function buildApp(): HTMLElement {
       <div class="card">
         <h2>局域网代理</h2>
         <div class="row">
-          <div>
-            <div class="label">启用局域网访问</div>
-            <div class="desc">通过反向代理在局域网内共享 dsh</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="status-dot" id="proxy-dot"></span>
+            <div>
+              <div class="label">启用局域网访问</div>
+              <div class="desc">通过反向代理在局域网内共享 dsh</div>
+            </div>
           </div>
           <label class="switch">
             <input type="checkbox" id="proxy-toggle" />
@@ -115,6 +153,7 @@ function buildApp(): HTMLElement {
           <div><div class="label">代理端口</div></div>
           <input type="number" id="proxy-port" min="1024" max="65535" />
         </div>
+        <div class="hint" id="proxy-port-hint" style="display:none"></div>
         <div class="url-box" id="proxy-url-box">
           <span class="off">代理未启用</span>
         </div>
@@ -154,6 +193,16 @@ function buildApp(): HTMLElement {
           <div><div class="label">检查间隔（小时）</div></div>
           <input type="number" id="set-interval" min="1" max="168" />
         </div>
+        <div class="row">
+          <div>
+            <div class="label">开机自动启动</div>
+            <div class="desc">Windows 登录后自动运行并驻留托盘</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="set-autolaunch" />
+            <span class="slider"></span>
+          </label>
+        </div>
       </div>
     </div>
   `) as HTMLElement;
@@ -167,21 +216,43 @@ function renderDshStatus(s: DshStatus) {
   text.classList.toggle("running", s.running);
   text.textContent = s.running ? "运行中" : "未运行";
   url.textContent = s.url;
-  (document.getElementById("btn-open") as HTMLButtonElement).disabled = !s.running;
-  (document.getElementById("btn-stop") as HTMLButtonElement).disabled = !s.running;
+  const btnOpen = document.getElementById("btn-open") as HTMLButtonElement;
+  const btnStop = document.getElementById("btn-stop") as HTMLButtonElement;
+  btnOpen.disabled = !s.running;
+  btnStop.disabled = !s.running;
+  // 禁用态给出原因，避免“按钮怎么是灰的”困惑。
+  btnOpen.title = s.running ? "" : "dsh 未运行，请先启动（托盘左键或等待自动启动）";
+  btnStop.title = s.running ? "" : "dsh 未运行";
 }
 
 function renderProxy(info: ProxyInfo) {
   const box = document.getElementById("proxy-url-box")!;
   if (info.running && info.url) {
-    box.innerHTML = `<span id="proxy-url">${info.url}<span id="token-suffix"></span></span><span class="copy" id="copy-url" title="复制完整链接">⧉</span>`;
+    box.innerHTML = `<span id="proxy-url">${esc(info.url)}<span id="token-suffix"></span></span><span class="copy" id="copy-url" title="复制完整链接">⧉</span>`;
   } else if (info.running) {
     // 代理已启动但未能确定局域网 IP（常见于无外网路由的纯内网环境）。
-    box.innerHTML = `<span id="proxy-url">已启用（端口 ${info.port}），但未能确定局域网 IP；可在其他设备访问 http://&lt;本机IP&gt;:${info.port}/?token=&lt;令牌&gt;</span>`;
+    box.innerHTML = `<span id="proxy-url">已启用（端口 ${esc(info.port)}），但未能确定局域网 IP；可在其他设备访问 http://&lt;本机IP&gt;:${esc(info.port)}/?token=&lt;令牌&gt;</span>`;
   } else {
     box.innerHTML = `<span class="off">代理未启用</span>`;
   }
   (document.getElementById("proxy-toggle") as HTMLInputElement).checked = info.running;
+
+  document.getElementById("proxy-dot")!.classList.toggle("running", info.running);
+
+  // 运行中不允许改端口（改动不会作用于运行中的代理），并用提示说明实际端口。
+  const portInput = document.getElementById("proxy-port") as HTMLInputElement;
+  const hint = document.getElementById("proxy-port-hint")!;
+  portInput.disabled = info.running;
+  if (info.running) {
+    if (settings && info.port !== settings.lan_proxy_port) {
+      hint.textContent = `端口 ${settings.lan_proxy_port} 不可用，当前实际监听 ${info.port}；关闭代理后可修改端口`;
+    } else {
+      hint.textContent = "代理运行中，端口设置暂不可修改（关闭后可更改）";
+    }
+    hint.style.display = "";
+  } else {
+    hint.style.display = "none";
+  }
 }
 
 function renderVersion(v: VersionInfo) {
@@ -190,23 +261,34 @@ function renderVersion(v: VersionInfo) {
   if (v.update_available) {
     banner.style.display = "";
     body.innerHTML =
-      `dsh <strong>${v.latest}</strong> 可用（当前 ${v.installed ?? "?"}）。运行 ` +
+      `dsh <strong>${esc(v.latest)}</strong> 可用（当前 ${esc(v.installed ?? "?")}）。运行 ` +
       `<code>npm install -g @deepseek-ai/dsh</code> 升级。`;
   } else {
     banner.style.display = "none";
   }
+  // 同步 dsh 服务卡片中的版本号。
+  const ver = document.getElementById("dsh-version");
+  if (ver && v.installed) ver.textContent = `dsh v${v.installed}`;
 }
 
 function renderSettings(s: Settings) {
   settings = s;
   (document.getElementById("dsh-path") as HTMLInputElement).value = s.dsh_custom_path ?? "";
   (document.getElementById("proxy-port") as HTMLInputElement).value = String(s.lan_proxy_port);
-  (document.getElementById("proxy-token") as HTMLElement).textContent = s.lan_proxy_token || "—";
+  renderToken(s.lan_proxy_token);
   (document.getElementById("set-minimize") as HTMLInputElement).checked = s.minimize_to_tray;
   (document.getElementById("set-autostart") as HTMLInputElement).checked = s.auto_start_dsh;
   (document.getElementById("set-autoupdate") as HTMLInputElement).checked = s.auto_check_updates;
   (document.getElementById("set-interval") as HTMLInputElement).value = String(s.update_check_interval_hours);
+  (document.getElementById("set-autolaunch") as HTMLInputElement).checked = s.auto_launch_app;
   refreshPathWarning();
+}
+
+/// 令牌缩略展示（悬停可见全串），避免 64 位十六进制换行铺满卡片。
+function renderToken(token: string) {
+  const el = document.getElementById("proxy-token")!;
+  el.textContent = token ? `${token.slice(0, 8)}…${token.slice(-4)}` : "—";
+  el.title = token ? `${token}（点击复制）` : "";
 }
 
 /// 校验自定义 dsh 路径输入框当前内容，并在输入框下方展示警告（无问题则隐藏）。
@@ -232,8 +314,9 @@ function collectSettings(): Settings | null {
   return {
     ...settings,
     dsh_custom_path: (document.getElementById("dsh-path") as HTMLInputElement).value.trim() || null,
-    lan_proxy_port: parseInt((document.getElementById("proxy-port") as HTMLInputElement).value, 10) || settings.lan_proxy_port,
-    update_check_interval_hours: parseInt((document.getElementById("set-interval") as HTMLInputElement).value, 10) || settings.update_check_interval_hours,
+    lan_proxy_port: clampPort((document.getElementById("proxy-port") as HTMLInputElement).value, settings.lan_proxy_port),
+    update_check_interval_hours: clampHours((document.getElementById("set-interval") as HTMLInputElement).value, settings.update_check_interval_hours),
+    auto_launch_app: (document.getElementById("set-autolaunch") as HTMLInputElement).checked,
   };
 }
 
@@ -287,19 +370,43 @@ async function init() {
     /* 忽略 */
   }
 
-  // 初始数据。
-  const s = await invoke<Settings>("get_settings");
-  renderSettings(s);
-  const status = await invoke<DshStatus>("get_dsh_status");
-  renderDshStatus(status);
-  const proxy = await invoke<ProxyInfo>("get_proxy_info");
-  renderProxy(proxy);
+  // 初始数据：逐项容错——单个 invoke 失败（后端瞬时错误）不应中断初始化，
+  // 否则事件监听挂不上、按钮全部无响应，页面表现为“假死”。
+  try {
+    renderSettings(await invoke<Settings>("get_settings"));
+  } catch (e) {
+    toast(`读取设置失败: ${e}`);
+  }
+  try { renderDshStatus(await invoke<DshStatus>("get_dsh_status")); } catch { /* 忽略 */ }
+  try { renderProxy(await invoke<ProxyInfo>("get_proxy_info")); } catch { /* 忽略 */ }
+  // dsh 入口来源（全局安装 / 本地安装 / 自定义路径 / 未找到）。
+  try {
+    const r = await invoke<Resolution>("get_resolution");
+    const src = document.getElementById("dsh-source");
+    if (src) src.textContent = r.kind === "NotFound" ? "未找到 dsh" : r.source;
+  } catch { /* 忽略 */ }
 
+  bindEvents();
+  await listenEvents();
+
+  // 每隔几秒轮询 dsh 状态，以便捕获进程意外退出。
+  setInterval(async () => {
+    try {
+      const st = await invoke<DshStatus>("get_dsh_status");
+      renderDshStatus(st);
+    } catch { /* 忽略 */ }
+  }, 5000);
+}
+
+function bindEvents() {
   // 事件绑定。
   document.getElementById("btn-open")!.addEventListener("click", () => {
     invoke("open_harness_window" as any).catch(() => {
-      /* open_harness_window 是 Rust 辅助方法，已通过托盘打开；以下是兜底 */
-      window.open(`http://127.0.0.1:3080`, "_blank");
+      /* 后端命令失败时的兜底：用设置中的地址，而非硬编码 127.0.0.1:3080 */
+      const url = settings
+        ? `http://${settings.dsh_host}:${settings.dsh_port}`
+        : "http://127.0.0.1:3080";
+      window.open(url, "_blank");
     });
   });
   document.getElementById("btn-restart")!.addEventListener("click", async () => {
@@ -326,22 +433,45 @@ async function init() {
   document.getElementById("btn-regen")!.addEventListener("click", async () => {
     try {
       const token = await invoke<string>("regenerate_token");
-      (document.getElementById("proxy-token")!).textContent = token;
-      toast("访问令牌已重置");
+      renderToken(token);
+      toast(
+        settings?.lan_proxy_enabled
+          ? "访问令牌已重置（运行中的代理已用新令牌重启）"
+          : "访问令牌已重置"
+      );
       const info = await invoke<ProxyInfo>("get_proxy_info");
       renderProxy(info);
     } catch (e) {
       toast(`重置失败: ${e}`);
     }
   });
+
+  // 点击令牌复制全串（展示为缩略形式）。
+  document.getElementById("proxy-token")!.addEventListener("click", async () => {
+    try {
+      const token = await invoke<string>("get_proxy_token");
+      if (token) {
+        await navigator.clipboard.writeText(token);
+        toast("访问令牌已复制");
+      }
+    } catch { /* 忽略 */ }
+  });
   document.getElementById("proxy-url-box")!.addEventListener("click", async (e) => {
     const target = e.target as HTMLElement;
     if (target.id === "copy-url") {
-      const token = (await invoke<string>("get_proxy_token")) ?? "";
-      const info = await invoke<ProxyInfo>("get_proxy_info");
-      const full = info.url ? info.url + token : "";
-      if (full) await navigator.clipboard.writeText(full);
-      toast("已复制完整访问链接");
+      try {
+        const token = (await invoke<string>("get_proxy_token")) ?? "";
+        const info = await invoke<ProxyInfo>("get_proxy_info");
+        const full = info.url ? info.url + token : "";
+        if (!full) {
+          toast("未能获取访问链接（代理未启用或无法确定局域网 IP）");
+          return;
+        }
+        await navigator.clipboard.writeText(full);
+        toast("已复制完整访问链接");
+      } catch {
+        toast("复制失败");
+      }
     }
   });
 
@@ -360,24 +490,24 @@ async function init() {
   for (const id of ["dsh-path", "proxy-port", "set-interval"]) {
     document.getElementById(id)!.addEventListener("change", saveSettings);
   }
-  for (const id of ["set-minimize", "set-autostart", "set-autoupdate"]) {
+  for (const id of ["set-minimize", "set-autostart", "set-autoupdate", "set-autolaunch"]) {
     document.getElementById(id)!.addEventListener("change", saveSettings);
   }
+}
 
-  // Tauri 事件监听。
-  const unlisteners: UnlistenFn[] = [];
-  unlisteners.push(await listen<DshStatus>("dsh-status", (e) => renderDshStatus(e.payload)));
-  unlisteners.push(await listen<ProxyInfo>("proxy-info", (e) => renderProxy(e.payload)));
-  unlisteners.push(await listen<VersionInfo>("version-info", (e) => renderVersion(e.payload)));
-  unlisteners.push(await listen<Settings>("settings-changed", (e) => renderSettings(e.payload)));
-
-  // 每隔几秒轮询 dsh 状态，以便捕获进程意外退出。
-  setInterval(async () => {
+async function listenEvents() {
+  // Tauri 事件监听（单条失败不阻断其余监听）。
+  const subs: [string, (e: { payload: any }) => void][] = [
+    ["dsh-status", (e) => renderDshStatus(e.payload)],
+    ["proxy-info", (e) => renderProxy(e.payload)],
+    ["version-info", (e) => renderVersion(e.payload)],
+    ["settings-changed", (e) => renderSettings(e.payload)],
+  ];
+  for (const [event, handler] of subs) {
     try {
-      const st = await invoke<DshStatus>("get_dsh_status");
-      renderDshStatus(st);
+      await listen(event, handler);
     } catch { /* 忽略 */ }
-  }, 5000);
+  }
 }
 
 init();

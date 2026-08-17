@@ -102,7 +102,8 @@ body {
   font-size: 11px;
   color: var(--muted);
   margin-top: 2px;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .status-dot {
@@ -312,9 +313,48 @@ input:focus {
 .muted {
   color: var(--muted);
 }
+
+/* 代理端口提示行（运行中禁改 / 端口回退说明） */
+.hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--orange);
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+/* 键盘可达性：按钮与开关的焦点环 */
+.btn:focus-visible {
+  outline: 2px solid var(--accent-hi);
+  outline-offset: 2px;
+}
+.switch input:focus-visible + .slider {
+  outline: 2px solid var(--accent-hi);
+  outline-offset: 2px;
+}
+
+/* 深色主题下的滚动条 */
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--card-hi);
+  border-radius: 5px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
 .token {
   font-family: "Cascadia Code", "Consolas", monospace;
   font-size: 11px;
   color: var(--muted);
   word-break: break-all;
+  cursor: pointer;
+}
+.token:hover {
+  color: var(--text);
 }

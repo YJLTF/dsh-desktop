@@ -127,7 +127,20 @@ pub fn build_tray(app: &App) {
             ..
         } = event
         {
-            crate::open_harness_window_inner(tray.app_handle());
+            let app = tray.app_handle();
+            // dsh 运行中左键打开 Harness；未运行时左键只会得到“服务未就绪”通知，
+            // 不如直接唤起控制面板让用户先启动服务。
+            let running = app
+                .try_state::<crate::process::DshState>()
+                .map(|s| s.is_running())
+                .unwrap_or(false);
+            if running {
+                crate::open_harness_window_inner(app);
+            } else if let Some(w) = app.get_webview_window("control-panel") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
         }
     });
 }
