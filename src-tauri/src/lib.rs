@@ -37,13 +37,12 @@ pub fn copy_text(text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Harness 窗口打开后最小化可见的控制面板，避免遮挡。
-fn minimize_control_panel(handle: &AppHandle) {
+/// Harness 窗口打开后将控制面板隐藏到托盘（不在任务栏占位），仅显示 Harness 窗口。
+/// 恢复路径（托盘“显示控制面板”、二次启动唤起）均已先 unminimize 再 show，
+/// 因此即使隐藏前处于最小化状态也能正常还原。
+fn hide_control_panel(handle: &AppHandle) {
     if let Some(panel) = handle.get_webview_window("control-panel") {
-        // 仅在可见时最小化：隐藏（托盘驻留）的窗口最小化会被重新显示。
-        if panel.is_visible().unwrap_or(false) {
-            let _ = panel.minimize();
-        }
+        let _ = panel.hide();
     }
 }
 
@@ -97,7 +96,7 @@ pub async fn open_harness_window_checked(handle: &AppHandle) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
-        minimize_control_panel(handle);
+        hide_control_panel(handle);
         return;
     }
 
@@ -124,7 +123,7 @@ pub async fn open_harness_window_checked(handle: &AppHandle) {
             // 用 eval 再触发一次导航：部分 WebView2 环境下首次 External 加载会黑屏，
             // 二次导航可强制渲染。
             let _ = w.eval(&format!("window.location.href = '{dsh_url}';"));
-            minimize_control_panel(handle);
+            hide_control_panel(handle);
         }
         Err(e) => {
             log::error!("创建 Harness 窗口失败：{e}");
@@ -206,6 +205,9 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("control-panel") {
+                // 面板可能在最小化状态下被隐藏到托盘（打开 Harness 后），
+                // Windows 上对最小化窗口 show() 是空操作，须先 unminimize 才能还原。
+                let _ = w.unminimize();
                 let _ = w.show();
                 let _ = w.set_focus();
             }
