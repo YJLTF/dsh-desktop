@@ -97,10 +97,9 @@ pub async fn gather(handle: &AppHandle) -> DshVersion {
 pub async fn check_for_updates(handle: AppHandle) -> Result<DshVersion, String> {
     let info = gather(&handle).await;
     let _ = handle.emit("version-info", info.clone());
-    if info.update_available {
-        if let Some(main) = APP_HANDLE.get() {
-            crate::tray::set_update_badge(main, true);
-        }
+    // 无条件按最新结果设置徽标：升级后发现“已是最新”也要把徽标切回普通图标。
+    if let Some(main) = APP_HANDLE.get() {
+        crate::tray::set_update_badge(main, info.update_available);
     }
     Ok(info)
 }
@@ -117,8 +116,8 @@ pub fn spawn_periodic_check() {
             if settings.auto_check_updates {
                 let info = gather(handle).await;
                 let _ = handle.emit("version-info", info.clone());
+                crate::tray::set_update_badge(handle, info.update_available);
                 if info.update_available {
-                    crate::tray::set_update_badge(handle, true);
                     let _ = crate::notify(
                         "发现 DeepSeek Harness 新版本",
                         &format!(

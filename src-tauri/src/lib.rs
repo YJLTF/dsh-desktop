@@ -1,3 +1,4 @@
+mod autostart;
 mod process;
 mod proxy;
 mod settings;
@@ -37,13 +38,12 @@ pub fn copy_text(text: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Harness 窗口打开后最小化可见的控制面板，避免遮挡。
-fn minimize_control_panel(handle: &AppHandle) {
+/// Harness 窗口打开后将控制面板隐藏到托盘（不在任务栏占位），仅显示 Harness 窗口。
+/// 恢复路径（托盘“显示控制面板”、二次启动唤起）均已先 unminimize 再 show，
+/// 因此即使隐藏前处于最小化状态也能正常还原。
+fn hide_control_panel(handle: &AppHandle) {
     if let Some(panel) = handle.get_webview_window("control-panel") {
-        // 仅在可见时最小化：隐藏（托盘驻留）的窗口最小化会被重新显示。
-        if panel.is_visible().unwrap_or(false) {
-            let _ = panel.minimize();
-        }
+        let _ = panel.hide();
     }
 }
 
@@ -56,7 +56,7 @@ pub fn open_harness_window_inner(handle: &AppHandle) {
 }
 
 /// 判断 WebView 当前地址是否指向 dsh 服务（localhost 与 127.0.0.1 视为等同）。
-fn url_points_to_dsh(current: &url::Url, dsh_host: &str, dsh_port: u16) -> bool {
+pub fn url_points_to_dsh(current: &url::Url, dsh_host: &str, dsh_port: u16) -> bool {
     let host_ok = match current.host_str() {
         Some(h) => {
             h == dsh_host
@@ -97,7 +97,7 @@ pub async fn open_harness_window_checked(handle: &AppHandle) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
-        minimize_control_panel(handle);
+        hide_control_panel(handle);
         return;
     }
 
@@ -124,7 +124,7 @@ pub async fn open_harness_window_checked(handle: &AppHandle) {
             // 用 eval 再触发一次导航：部分 WebView2 环境下首次 External 加载会黑屏，
             // 二次导航可强制渲染。
             let _ = w.eval(&format!("window.location.href = '{dsh_url}';"));
-            minimize_control_panel(handle);
+            hide_control_panel(handle);
         }
         Err(e) => {
             log::error!("创建 Harness 窗口失败：{e}");
@@ -144,8 +144,21 @@ fn update_settings(handle: AppHandle, incoming: Settings) -> Result<Settings, St
     let state = handle.state::<settings::SettingsState>();
     let mut guard = state.0.lock().expect("设置锁已中毒");
     let mut next = incoming;
+
+    // 端口范围校验：越界值会让 serde 反序列化失败，导致任何设置都保存不了。
+    if !(1024..=65535).contains(&next.lan_proxy_port) {
+        return Err(format!("代理端口必须在 1024–65535 之间：{}", next.lan_proxy_port));
+    }
+    if !(1024..=65535).contains(&next.dsh_port) {
+        return Err(format!("dsh 端口必须在 1024–65535 之间：{}", next.dsh_port));
+    }
+
     if next.lan_proxy_token.trim().is_empty() {
         next.lan_proxy_token = guard.lan_proxy_token.clone();
+    }
+    // 开机自启动变化时同步注册表。
+    if next.auto_launch_app != guard.auto_launch_app {
+        autostart::set_enabled(next.auto_launch_app)?;
     }
     *guard = next.clone();
     drop(guard);
@@ -153,17 +166,27 @@ fn update_settings(handle: AppHandle, incoming: Settings) -> Result<Settings, St
     Ok(next)
 }
 
-/// 重新生成局域网访问令牌。
+/// 重新生成局域网访问令牌；代理运行中则重启代理使新令牌立即生效
+///（ProxyState 持有旧令牌的副本，不重启的话新令牌会被 401 拒绝、旧令牌继续可用）。
 #[tauri::command]
-fn regenerate_token(handle: AppHandle) -> Result<String, String> {
+async fn regenerate_token(handle: AppHandle) -> Result<String, String> {
     let state = handle.state::<settings::SettingsState>();
-    let mut guard = state.0.lock().expect("设置锁已中毒");
-    let token = settings::generate_token();
-    guard.lan_proxy_token = token.clone();
-    let next = guard.clone();
-    drop(guard);
-    settings::persist_and_sync(&next);
-    Ok(token)
+    let updated = {
+        let mut guard = state.0.lock().expect("设置锁已中毒");
+        guard.lan_proxy_token = settings::generate_token();
+        guard.clone()
+    };
+    let new_token = updated.lan_proxy_token.clone();
+    settings::persist_and_sync(&updated);
+
+    let runtime = handle.state::<proxy::ProxyRuntime>();
+    if proxy::is_running(&runtime).await {
+        let _ = proxy::stop_proxy(handle.clone(), runtime.clone()).await;
+        if let Err(e) = proxy::start_proxy(handle.clone(), runtime).await {
+            log::error!("重置令牌后重启代理失败：{e}");
+        }
+    }
+    Ok(new_token)
 }
 
 #[tauri::command]
@@ -206,6 +229,9 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("control-panel") {
+                // 面板可能在最小化状态下被隐藏到托盘（打开 Harness 后），
+                // Windows 上对最小化窗口 show() 是空操作，须先 unminimize 才能还原。
+                let _ = w.unminimize();
                 let _ = w.show();
                 let _ = w.set_focus();
             }
@@ -217,6 +243,9 @@ pub fn run() {
             // 加载并注册设置状态。
             let loaded = settings::Settings::load().unwrap_or_default();
             app.manage(settings::SettingsState(std::sync::Mutex::new(loaded.clone())));
+
+            // 开机自启动：以设置为准同步注册表（纠正用户手动改注册表造成的不一致）。
+            autostart::sync_from_settings(&loaded);
 
             // 注册长期存活的运行时状态。
             app.manage(process::DshState::default());

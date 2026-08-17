@@ -30,6 +30,12 @@ pub struct Settings {
     /// 局域网代理监听的端口。
     #[serde(default = "default_proxy_port")]
     pub lan_proxy_port: u16,
+    /// 是否已展示过“防火墙放行”提示（每个安装生命周期只提示一次）。
+    #[serde(default)]
+    pub firewall_hint_shown: bool,
+    /// Windows 登录时自动启动本应用（HKCU Run 注册表项，随设置开启/关闭）。
+    #[serde(default)]
+    pub auto_launch_app: bool,
     /// 从局域网访问代理所需的共享密钥。
     #[serde(default)]
     pub lan_proxy_token: String,
@@ -69,6 +75,8 @@ impl Default for Settings {
             update_check_interval_hours: 24,
             lan_proxy_enabled: false,
             lan_proxy_port: 3081,
+            firewall_hint_shown: false,
+            auto_launch_app: false,
             lan_proxy_token: String::new(),
             dsh_custom_path: None,
             dsh_host: default_dsh_host(),
@@ -99,7 +107,19 @@ impl Settings {
         }
         if path.exists() {
             let raw = fs::read_to_string(&path)?;
-            let mut s: Settings = serde_json::from_str(&raw).unwrap_or_default();
+            let mut s: Settings = match serde_json::from_str(&raw) {
+                Ok(s) => s,
+                Err(e) => {
+                    // 解析失败：保留备份再回退默认值，避免用户自定义路径、令牌无迹可寻地丢失。
+                    let backup = path.with_extension("json.bak");
+                    let _ = fs::copy(&path, &backup);
+                    log::error!(
+                        "settings.json 解析失败（{e}），已备份至 {} 并使用默认设置",
+                        backup.display()
+                    );
+                    Settings::default()
+                }
+            };
             if s.lan_proxy_token.is_empty() {
                 s.lan_proxy_token = generate_token();
                 let _ = s.save();

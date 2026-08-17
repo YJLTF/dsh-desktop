@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -74,6 +74,18 @@ impl DshState {
         self.resolution.lock().await.clone()
     }
 
+    /// 同步判断 dsh 子进程是否存活（供托盘事件等同步上下文使用）。
+    /// 取锁失败（正在启动/停止）时保守地返回 false。
+    pub fn is_running(&self) -> bool {
+        let Ok(mut guard) = self.child.try_lock() else {
+            return false;
+        };
+        match guard.as_mut() {
+            Some(c) => c.try_wait().map(|s| s.is_none()).unwrap_or(false),
+            None => false,
+        }
+    }
+
     /// 立即结束 dsh 子进程（若存在）。供应用退出钩子同步调用，
     /// 避免应用退出后遗留孤儿 node 进程占用端口。
     pub fn shutdown_blocking(&self) {
@@ -115,7 +127,8 @@ fn script_in_node_modules(node_modules_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// 通过 `npm root -g` 解析全局 node_modules 根目录。
+/// 通过 `npm root -g` 解析全局 node_modules 根目录（动态查询，跟随 npm prefix 变化，
+/// 不写死路径）。这是默认路径检查的首选方式。
 fn global_node_modules() -> Option<PathBuf> {
     let mut cmd = std::process::Command::new(npm_exe()?);
     cmd.args(["root", "-g"]);
@@ -125,21 +138,69 @@ fn global_node_modules() -> Option<PathBuf> {
     if !out.status.success() {
         return None;
     }
+    // npm 偶尔会在 stdout 混入通知行；路径始终在最后一个非空行上。
     let text = String::from_utf8_lossy(&out.stdout);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
-    }
+    let line = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .last()?;
+    Some(PathBuf::from(line))
 }
 
 fn node_exe() -> Option<PathBuf> {
     which::which("node").ok().or_else(|| which::which("node.exe").ok())
 }
 
+/// 在 node 可执行文件同目录下查找的 npm 文件名。Windows 上 node 目录同时附带
+/// 无扩展名的 npm（sh 脚本，CreateProcess 无法直接运行），必须优先检查 npm.cmd。
+#[cfg(windows)]
+const NPM_FILES: &[&str] = &["npm.cmd"];
+#[cfg(not(windows))]
+const NPM_FILES: &[&str] = &["npm"];
+
+/// 解析 npm 可执行文件路径。GUI 子系统应用继承自 Shell 的 PATH 可能缺失用户级 npm
+/// 目录（Win10 上“已安装全局包却找不到 dsh”的常见原因）：优先用 node 同目录的 npm，
+/// 再查 PATH，最后回退到 npm 用户级前缀（Windows 为 %APPDATA%\npm，由环境变量推导）。
 fn npm_exe() -> Option<PathBuf> {
-    which::which("npm").ok().or_else(|| which::which("npm.cmd").ok())
+    if let Some(node) = node_exe() {
+        if let Some(dir) = node.parent() {
+            for name in NPM_FILES {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    for name in NPM_FILES {
+        if let Ok(found) = which::which(name) {
+            return Some(found);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let candidate = PathBuf::from(appdata).join("npm").join("npm.cmd");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// npm 不可用（找不到 / 执行失败）时的兜底：由环境变量推导全局 node_modules 目录。
+/// Windows 上 npm 默认全局前缀为 %APPDATA%\npm，其 node_modules 子目录即全局包目录。
+/// 这是基于 npm 约定 + 环境变量的推导，而非写死机器特定路径。
+fn global_node_modules_fallback() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let appdata = std::env::var_os("APPDATA")?;
+        let dir = PathBuf::from(appdata).join("npm").join("node_modules");
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 /// 校验自定义 dsh 路径，返回需要向用户提示的警告信息（None 表示无问题）。
@@ -207,8 +268,15 @@ pub async fn resolve_dsh(custom: &Option<String>) -> Resolution {
             }
         }
 
-        // 3. 全局 node_modules（npm root -g 返回的路径本身就是 node_modules 目录）。
-        if let Some(root) = global_node_modules() {
+        // 3. 全局 node_modules：首选 `npm root -g` 动态解析（自动跟随 npm prefix，
+        //    含用户自定义 prefix）；npm 不可用时回退到由环境变量推导的默认全局目录。
+        //    npm 冷启动可达秒级，放阻塞线程池避免拖慢 tokio 工作线程。
+        let global_root = tokio::task::spawn_blocking(global_node_modules)
+            .await
+            .ok()
+            .flatten()
+            .or_else(global_node_modules_fallback);
+        if let Some(root) = global_root {
             if let Some(script) = script_in_node_modules(&root) {
                 return Resolution::Node {
                     node: node.to_string_lossy().into_owned(),
@@ -292,11 +360,12 @@ pub async fn probe_server(host: &str, port: u16, timeout: Duration) -> bool {
     }
 }
 
-/// 清理占用指定端口的遗留 node（dsh）进程。
+/// 清理占用指定端口的遗留 dsh 进程。
 /// 上次会话若被强杀（如任务管理器结束进程），dsh 子进程会残留并占用端口，
 /// 导致本次启动的新子进程因端口冲突静默退出。
+/// `extra_image`：独立可执行文件方式运行时的进程映像名（node 方式固定匹配 node）。
 #[cfg(windows)]
-async fn cleanup_stale_port_owner(port: u16) {
+async fn cleanup_stale_port_owner(port: u16, extra_image: Option<&str>) {
     use std::process::Command as StdCommand;
 
     // 通过 netstat 找到监听该端口的 PID。
@@ -319,7 +388,7 @@ async fn cleanup_stale_port_owner(port: u16) {
             && parts[1].ends_with(&suffix)
         {
             let pid = parts[4];
-            if pid.chars().all(|c| c.is_ascii_digit()) && kill_if_node(pid) {
+            if pid.chars().all(|c| c.is_ascii_digit()) && kill_if_stale(pid, extra_image) {
                 log::info!("已清理遗留的 dsh 进程（PID {pid}）");
                 killed = true;
             }
@@ -331,9 +400,9 @@ async fn cleanup_stale_port_owner(port: u16) {
     }
 }
 
-/// 若 PID 对应的是 node 进程则强制结束它，返回是否已结束。
+/// 若 PID 对应的是 node 进程（或指定的 dsh 可执行文件）则强制结束它，返回是否已结束。
 #[cfg(windows)]
-fn kill_if_node(pid: &str) -> bool {
+fn kill_if_stale(pid: &str, extra_image: Option<&str>) -> bool {
     use std::process::Command as StdCommand;
 
     let mut tasklist = StdCommand::new("tasklist");
@@ -347,8 +416,13 @@ fn kill_if_node(pid: &str) -> bool {
     let Some(first_line) = text.lines().next() else {
         return false;
     };
-    // 只结束 node 进程（dsh 的载体），避免误杀其他服务。
-    if !first_line.to_lowercase().starts_with("\"node") {
+    // 只结束 node 进程（dsh 的载体）或解析出的自定义可执行文件，避免误杀其他服务。
+    let image = first_line.to_lowercase();
+    let matched = image.starts_with("\"node")
+        || extra_image
+            .map(|m| image.starts_with(&format!("\"{}", m.to_lowercase())))
+            .unwrap_or(false);
+    if !matched {
         return false;
     }
     let mut taskkill = StdCommand::new("taskkill");
@@ -424,7 +498,14 @@ pub async fn start_dsh(
 
     // 清理上次会话遗留的 dsh 孤儿进程，避免端口冲突导致新子进程静默退出。
     #[cfg(windows)]
-    cleanup_stale_port_owner(settings.dsh_port).await;
+    let stale_image = match &resolution {
+        Resolution::Executable { exe, .. } => std::path::Path::new(exe)
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned()),
+        _ => None,
+    };
+    #[cfg(windows)]
+    cleanup_stale_port_owner(settings.dsh_port, stale_image.as_deref()).await;
 
     let child = cmd.spawn().map_err(|e| format!("拉起 dsh 失败：{e}"))?;
 
@@ -451,6 +532,19 @@ pub async fn start_dsh(
         emit_status(&handle, false);
         return Err("dsh 启动失败：进程已退出或服务未在规定时间内变为可达".into());
     }
+
+    // 若 Harness 窗口已打开且指向本服务，刷新它以重连新进程
+    // （重启后旧页面的 WebSocket / 会话已失效，不刷新会停留在过期状态）。
+    if let Some(w) = handle.get_webview_window("harness-ui") {
+        let points_to_dsh = w
+            .url()
+            .map(|u| crate::url_points_to_dsh(&u, &host, port))
+            .unwrap_or(false);
+        if points_to_dsh {
+            let _ = w.eval("window.location.reload();");
+        }
+    }
+
     Ok(format!("http://{}:{}", host, port))
 }
 
@@ -504,11 +598,22 @@ pub async fn get_dsh_status(
 }
 
 /// 返回 dsh 的解析方式（供界面展示）。
+/// dsh 运行中回报启动时实际使用的解析结果（最准确）；否则按当前设置实时解析。
+/// 不能只读缓存：缓存在 start_dsh 时才写入，应用启动、面板先于 dsh 拉起加载时
+/// 缓存还是 NotFound 默认值，会误显示“未找到 dsh”（版本号却正常显示）。
 #[tauri::command]
 pub async fn get_resolution(
+    handle: AppHandle,
     state: tauri::State<'_, DshState>,
 ) -> Result<Resolution, String> {
-    Ok(state.resolution().await)
+    if state.is_running() {
+        let cached = state.resolution().await;
+        if !matches!(cached, Resolution::NotFound { .. }) {
+            return Ok(cached);
+        }
+    }
+    let settings = settings::current(&handle);
+    Ok(resolve_dsh(&settings.dsh_custom_path).await)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
