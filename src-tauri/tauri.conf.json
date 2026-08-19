@@ -54,7 +54,12 @@
     ],
     "windows": {
       "wix": {
-        "language": "zh-CN"
+        "language": "zh-CN",
+        "fragmentPaths": ["./msi/legacy-upgrade.wxs"],
+        "componentGroupRefs": ["LegacyCleanupGroup"]
+      },
+      "nsis": {
+        "installerHooks": "./nsis/installer-hooks.nsh"
       },
       "webviewInstallMode": {
         "type": "downloadBootstrapper"

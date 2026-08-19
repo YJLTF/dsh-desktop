@@ -53,6 +53,14 @@ npx tauri build
 
 MSI 文件名末尾的 `zh-CN` 是安装器界面语言（`bundle.windows.wix.language`），非系统区域问题。
 
+## 从旧版 DeepSeek Harness 升级
+
+应用由 `DeepSeek Harness` 更名为 `DSH Desktop`，两版安装器均自动完成旧版迁移：
+
+- **NSIS 安装器** —— 安装前扫描“应用与功能”注册表（`DisplayName = "DeepSeek Harness"`），静默卸载旧版（NSIS / MSI 安装均可识别）后再安装新版
+- **MSI 安装器** —— 在 Upgrade 表登记旧版 UpgradeCode，安装时由 `RemoveExistingProducts` 自动卸载旧 MSI
+- **运行时** —— 首次启动会把旧配置 `settings.json` 迁移到新目录并删除旧配置目录
+
 开发调试命令见 [AGENTS.md](AGENTS.md)。
 
 ## 使用
