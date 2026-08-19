@@ -97,6 +97,7 @@ function buildApp(): HTMLElement {
         <div class="banner-row">
           <span class="badge">新版本</span>
           <div class="banner-body" id="update-body"></div>
+          <button class="btn btn-update" id="btn-update">立即更新</button>
         </div>
       </div>
 
@@ -255,14 +256,22 @@ function renderProxy(info: ProxyInfo) {
   }
 }
 
+/// 是否有更新正在进行（控制横幅按钮文案 / 禁用态）。
+let updating = false;
+
 function renderVersion(v: VersionInfo) {
   const banner = document.getElementById("update-banner")!;
   const body = document.getElementById("update-body")!;
   if (v.update_available) {
     banner.style.display = "";
     body.innerHTML =
-      `dsh <strong>${esc(v.latest)}</strong> 可用（当前 ${esc(v.installed ?? "?")}）。运行 ` +
-      `<code>npm install -g @deepseek-ai/dsh</code> 升级。`;
+      `dsh <strong>${esc(v.latest)}</strong> 可用（当前 ${esc(v.installed ?? "?")}）`;
+    // 上次更新失败后按钮可能停留在禁用态，重新渲染时恢复。
+    const btn = document.getElementById("btn-update") as HTMLButtonElement;
+    if (btn && !updating) {
+      btn.disabled = false;
+      btn.textContent = "立即更新";
+    }
   } else {
     banner.style.display = "none";
   }
@@ -442,6 +451,25 @@ function bindEvents() {
     }
   });
 
+  document.getElementById("btn-update")!.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-update") as HTMLButtonElement;
+    if (updating || btn.disabled) return;
+    updating = true;
+    btn.disabled = true;
+    btn.textContent = "正在更新…";
+    try {
+      const v = await invoke<VersionInfo>("update_dsh");
+      renderVersion(v);
+      toast(`已更新到 dsh v${v.installed ?? "最新版"}`);
+    } catch (e) {
+      toast(`更新失败: ${e}`);
+      btn.disabled = false;
+      btn.textContent = "立即更新";
+    } finally {
+      updating = false;
+    }
+  });
+
   document.getElementById("proxy-toggle")!.addEventListener("change", (e) => {
     toggleProxy((e.target as HTMLInputElement).checked);
   });
@@ -517,6 +545,11 @@ async function listenEvents() {
     ["proxy-info", (e) => renderProxy(e.payload)],
     ["version-info", (e) => renderVersion(e.payload)],
     ["settings-changed", (e) => renderSettings(e.payload)],
+    // 一键更新阶段进度（后端文案直接显示在按钮上）。
+    ["update-progress", (e) => {
+      const btn = document.getElementById("btn-update");
+      if (btn && e.payload?.message) btn.textContent = String(e.payload.message);
+    }],
   ];
   for (const [event, handler] of subs) {
     try {

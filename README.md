@@ -1,6 +1,6 @@
 # DSH Desktop
 
-[@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh)（DeepSeek Harness）的轻量 Windows 桌面客户端：系统托盘驻留、一键拉起 `dsh web` 服务、版本升级检测与局域网共享代理。
+[@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh)（DeepSeek Harness）的轻量 Windows 桌面客户端：系统托盘驻留、一键拉起 `dsh web` 服务、版本升级检测与一键更新、局域网共享代理。
 
 基于 [Tauri 2](https://v2.tauri.app/) 构建，前端为原生 TypeScript（Vite），后端为 Rust（axum 反向代理）。
 
@@ -10,6 +10,7 @@
 - **自动发现与拉起** —— 自动发现已安装的 `@deepseek-ai/dsh`（自定义路径 → 本地 node_modules → `npm root -g` 全局安装，三级查找），拉起 `dsh web` 子进程并做健康探测；支持启动 / 停止 / 重启，异常退出自动检测
 - **版本与来源展示** —— 面板实时显示已安装的 dsh 版本号与入口来源（全局安装 / 本地安装 / 自定义路径）
 - **自定义 dsh 入口** —— 支持通过文件选择窗指定自定义的 `bin.js` 脚本或可执行文件，路径无效时面板显式警告
+- **一键更新** —— 检测到新版本时面板横幅提供“立即更新”按钮：自动停止运行中的 dsh、执行 `npm install -g @deepseek-ai/dsh@latest` 并恢复运行，全程按钮显示阶段进度（仅支持全局安装来源；自定义路径 / 本地安装会提示手动升级）
 - **孤儿进程清理** —— 上次会话被强杀残留的 dsh 进程会在下次启动前自动清理，避免端口冲突导致启动失败；退出应用时自动回收子进程
 - **白屏防护** —— 打开 Harness 窗口前等待服务就绪；dsh 重启空窗期内不会导航到错误页，重启成功后已打开的 Harness 窗口自动刷新
 

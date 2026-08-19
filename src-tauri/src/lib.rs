@@ -319,6 +319,7 @@ pub fn run() {
             process::validate_dsh_path,
             // 版本
             version::check_for_updates,
+            version::update_dsh,
             // 代理
             proxy::start_proxy,
             proxy::stop_proxy,

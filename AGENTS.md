@@ -67,6 +67,11 @@ DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [RE
 - **前端 init 逐项容错**：单项 `invoke` 失败不应中断初始化（否则事件监听挂不上、页面假死）；新增初始化调用保持 try/catch 包裹。
 - **`Settings` 结构变更**：新字段必须加 `#[serde(default ...)]` 并同步 `Default` 实现、前端 `Settings` 接口与 `collectSettings`，否则旧配置文件反序列化失败会触发 `.bak` 备份回退。
 
+### dsh 一键更新（version.rs::update_dsh）
+- **仅支持"全局安装"来源**：自定义路径 / 本地 node_modules（安装目录可能不可写，或不在 npm 管辖内）会拒绝并提示手动升级，判定依据是 `Resolution.source == "全局安装"`。
+- **更新流程**：停 dsh（若运行中）→ `npm install -g @deepseek-ai/dsh@latest`（CREATE_NO_WINDOW、10 分钟超时）→ 恢复运行 → `gather()` 刷新横幅与托盘徽标；npm 失败时旧包通常完好，尽量恢复旧版运行后再报错。
+- **防重入**：`UPDATING` AtomicBool（npm 安装可达分钟级）；阶段进度经 `update-progress` 事件推送，message 直接用作前端按钮文案。
+
 ### 其他
 - **CSP 已收紧**（`tauri.conf.json`）：新增需要外部连接/内联脚本的功能时须同步调整 `security.csp`。
 - **退出清理**：`RunEvent::Exit` 中调用 `DshState::shutdown_blocking()` 结束 dsh 子进程；`app.exit()` 不执行受管状态析构，删掉该钩子会遗留孤儿 node 进程占用端口。
