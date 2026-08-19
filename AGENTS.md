@@ -58,7 +58,8 @@ DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [RE
 - **启停必须持 `ProxyRuntime::op_lock`**：开机自动恢复与用户手动开关可能并发，分段锁（shutdown/join）会造成双绑定。新增修改代理生命周期的命令时先取该锁。
 - **端口可能回退**：Win10 上 Hyper-V/WSL/VPN 会随机保留端口段（bind 报 WSAEACCES 10013），`bind_listener` 失败重试后回退系统分配端口。因此**实际监听端口以 `ProxyRuntime::port` 记录为准**，`get_proxy_info` 已按此回报；不要假设监听端口等于 `settings.lan_proxy_port`。
 - **令牌是启动时克隆进 `ProxyState` 的**：修改令牌（`regenerate_token`）必须重启运行中的代理才生效，否则新令牌被 401、旧令牌继续可用。调整令牌相关逻辑时保持这一联动。
-- **请求体流式透传**：`forward_http` 用 `BodyStream` + `wrap_stream` 转发请求体（GET/HEAD 跳过），不要改回 `collect().to_bytes()` 整包缓冲——大附件上传时内存峰值会与请求体等大。
+- **请求体流式透传**：`forward_http` 用 `BodyStream` + `wrap_stream` 转发请求体（GET/HEAD 跳过），不要改回 `collect().to_bytes()` 整包缓冲——大附件上传时内存峰值会与请求体等大。响应侧同理：**只有 `text/html` 且未压缩的响应**会整包缓冲注入垫片（见下条），其余响应保持 `bytes_stream()` 流式，勿扩大缓冲范围。
+- **HTML 响应注入 secure-context 垫片**：局域网代理是 `http://<内网IP>` 明文访问，页面处于非安全上下文，浏览器不暴露 `crypto.randomUUID`（安全上下文专属），而 dsh 前端每条 RPC 都要用它生成 ID——打开工作区即报 "crypto.randomUUID is not a function"。代理在 `<head>` 后注入基于 `crypto.getRandomValues`（非安全上下文可用）的 v4 UUID 垫片（`POLYFILL_SCRIPT`）。两个联动约束：转发请求时**剥掉 `accept-encoding`**（上游返回压缩 HTML 就无法注入，代理→dsh 是回环无压缩代价）；改写仅限 4 MiB 内的合法 UTF-8 HTML（`inject_polyfill` 找不到 `<head>`/`<html>` 即返回 None 原样透传），不要为了"更早执行"改成无脑前插。
 - **`lan_ip()` 已带 10 秒缓存**（含失败结果缓存），可放心在命令中调用；探测链为多目标 UDP connect → 主机名解析兜底。
 
 ### 设置与前端
