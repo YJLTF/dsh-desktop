@@ -1,6 +1,6 @@
 # AGENTS.md
 
-DeepSeek Harness 桌面客户端的开发指南与注意事项。功能特性见 [README.md](README.md)。
+DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [README.md](README.md)。
 
 ## 构建 / 测试命令
 

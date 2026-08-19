@@ -1,4 +1,4 @@
-# DeepSeek Harness 桌面客户端
+# DSH Desktop
 
 [@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh)（DeepSeek Harness）的轻量 Windows 桌面客户端：系统托盘驻留、一键拉起 `dsh web` 服务、版本升级检测与局域网共享代理。
 
@@ -48,8 +48,8 @@ npx tauri build
 
 | 格式 | 路径 |
 |------|------|
-| MSI | `msi/DeepSeek Harness_<版本>_x64_zh-CN.msi` |
-| NSIS | `nsis/DeepSeek Harness_<版本>_x64-setup.exe` |
+| MSI | `msi/DSH Desktop_<版本>_x64_zh-CN.msi` |
+| NSIS | `nsis/DSH Desktop_<版本>_x64-setup.exe` |
 
 MSI 文件名末尾的 `zh-CN` 是安装器界面语言（`bundle.windows.wix.language`），非系统区域问题。
 
@@ -72,7 +72,7 @@ MSI 文件名末尾的 `zh-CN` 是安装器界面语言（`bundle.windows.wix.la
 运行时配置存放于用户配置目录，均可在控制面板中修改：
 
 ```
-%APPDATA%\deepseekai\DeepSeek Harness\config\settings.json
+%APPDATA%\deepseekai\DSH Desktop\config\settings.json
 ```
 
 包含：托盘最小化、dsh 自动启动、开机自启动应用、更新检查开关与间隔、局域网代理开关 / 端口 / 访问令牌、自定义 dsh 路径等。配置文件损坏时会自动备份为 `.json.bak` 并回退默认值。

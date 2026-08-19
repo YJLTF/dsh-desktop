@@ -784,37 +784,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deepseek-harness-desktop"
-version = "0.1.1"
-dependencies = [
- "arboard",
- "axum",
- "directories",
- "futures-util",
- "http-body-util",
- "hyper",
- "log",
- "rand 0.9.5",
- "reqwest 0.12.28",
- "semver",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-notification",
- "tauri-plugin-shell",
- "tauri-plugin-single-instance",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tower",
- "tower-http",
- "tungstenite 0.26.2",
- "url",
- "which",
-]
-
-[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -983,6 +952,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "dsh-desktop"
+version = "0.1.2"
+dependencies = [
+ "arboard",
+ "axum",
+ "directories",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "log",
+ "rand 0.9.5",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-notification",
+ "tauri-plugin-shell",
+ "tauri-plugin-single-instance",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tower",
+ "tower-http",
+ "tungstenite 0.26.2",
+ "url",
+ "which",
 ]
 
 [[package]]

@@ -119,7 +119,7 @@ pub fn spawn_periodic_check() {
                 crate::tray::set_update_badge(handle, info.update_available);
                 if info.update_available {
                     let _ = crate::notify(
-                        "发现 DeepSeek Harness 新版本",
+                        "发现 DSH 新版本",
                         &format!(
                             "dsh {} 已发布（当前版本 {}）。升级命令：npm install -g @deepseek-ai/dsh",
                             info.latest.as_deref().unwrap_or("?"),

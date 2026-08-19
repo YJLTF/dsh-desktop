@@ -88,7 +88,7 @@ impl Default for Settings {
 impl Settings {
     /// 解析 settings.json 在用户配置目录中的位置。
     pub fn config_dir() -> PathBuf {
-        let base = directories::ProjectDirs::from("com", "deepseekai", "DeepSeek Harness")
+        let base = directories::ProjectDirs::from("com", "deepseekai", "DSH Desktop")
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         base

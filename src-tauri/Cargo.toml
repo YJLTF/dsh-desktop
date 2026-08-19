@@ -1,13 +1,13 @@
 [package]
-name = "deepseek-harness-desktop"
-version = "0.1.1"
+name = "dsh-desktop"
+version = "0.1.2"
 description = "Lightweight desktop client for DeepSeek Harness"
-authors = ["DeepSeek Harness Desktop"]
+authors = ["DSH Desktop"]
 edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "deepseek_harness_desktop_lib"
+name = "dsh_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

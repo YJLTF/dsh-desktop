@@ -88,7 +88,7 @@ function buildApp(): HTMLElement {
       <div class="header">
         <div class="logo">h</div>
         <div>
-          <h1>DeepSeek Harness</h1>
+          <h1>DSH Desktop</h1>
           <div class="ver" id="app-ver">桌面端 v—</div>
         </div>
       </div>
