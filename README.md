@@ -1,6 +1,6 @@
-# DeepSeek Harness 桌面客户端
+# DSH Desktop
 
-[@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh)（DeepSeek Harness）的轻量 Windows 桌面客户端：系统托盘驻留、一键拉起 `dsh web` 服务、版本升级检测与局域网共享代理。
+[@deepseek-ai/dsh](https://www.npmjs.com/package/@deepseek-ai/dsh)（DeepSeek Harness）的轻量 Windows 桌面客户端：系统托盘驻留、一键拉起 `dsh web` 服务、版本升级检测与一键更新、局域网共享代理。
 
 基于 [Tauri 2](https://v2.tauri.app/) 构建，前端为原生 TypeScript（Vite），后端为 Rust（axum 反向代理）。
 
@@ -10,6 +10,7 @@
 - **自动发现与拉起** —— 自动发现已安装的 `@deepseek-ai/dsh`（自定义路径 → 本地 node_modules → `npm root -g` 全局安装，三级查找），拉起 `dsh web` 子进程并做健康探测；支持启动 / 停止 / 重启，异常退出自动检测
 - **版本与来源展示** —— 面板实时显示已安装的 dsh 版本号与入口来源（全局安装 / 本地安装 / 自定义路径）
 - **自定义 dsh 入口** —— 支持通过文件选择窗指定自定义的 `bin.js` 脚本或可执行文件，路径无效时面板显式警告
+- **一键更新** —— 检测到新版本时面板横幅提供“立即更新”按钮：自动停止运行中的 dsh、执行 `npm install -g @deepseek-ai/dsh@latest` 并恢复运行，全程按钮显示阶段进度（仅支持全局安装来源；自定义路径 / 本地安装会提示手动升级）
 - **孤儿进程清理** —— 上次会话被强杀残留的 dsh 进程会在下次启动前自动清理，避免端口冲突导致启动失败；退出应用时自动回收子进程
 - **白屏防护** —— 打开 Harness 窗口前等待服务就绪；dsh 重启空窗期内不会导航到错误页，重启成功后已打开的 Harness 窗口自动刷新
 
@@ -48,10 +49,18 @@ npx tauri build
 
 | 格式 | 路径 |
 |------|------|
-| MSI | `msi/DeepSeek Harness_<版本>_x64_zh-CN.msi` |
-| NSIS | `nsis/DeepSeek Harness_<版本>_x64-setup.exe` |
+| MSI | `msi/DSH Desktop_<版本>_x64_zh-CN.msi` |
+| NSIS | `nsis/DSH Desktop_<版本>_x64-setup.exe` |
 
 MSI 文件名末尾的 `zh-CN` 是安装器界面语言（`bundle.windows.wix.language`），非系统区域问题。
+
+## 从旧版 DeepSeek Harness 升级
+
+应用由 `DeepSeek Harness` 更名为 `DSH Desktop`，两版安装器均自动完成旧版迁移：
+
+- **NSIS 安装器** —— 安装前扫描“应用与功能”注册表（`DisplayName = "DeepSeek Harness"`），静默卸载旧版（NSIS / MSI 安装均可识别）后再安装新版
+- **MSI 安装器** —— 在 Upgrade 表登记旧版 UpgradeCode，安装时由 `RemoveExistingProducts` 自动卸载旧 MSI
+- **运行时** —— 首次启动会把旧配置 `settings.json` 迁移到新目录并删除旧配置目录
 
 开发调试命令见 [AGENTS.md](AGENTS.md)。
 
@@ -72,7 +81,7 @@ MSI 文件名末尾的 `zh-CN` 是安装器界面语言（`bundle.windows.wix.la
 运行时配置存放于用户配置目录，均可在控制面板中修改：
 
 ```
-%APPDATA%\deepseekai\DeepSeek Harness\config\settings.json
+%APPDATA%\deepseekai\DSH Desktop\config\settings.json
 ```
 
 包含：托盘最小化、dsh 自动启动、开机自启动应用、更新检查开关与间隔、局域网代理开关 / 端口 / 访问令牌、自定义 dsh 路径等。配置文件损坏时会自动备份为 `.json.bak` 并回退默认值。

@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <!--
+    旧版 DeepSeek Harness（productName = "DeepSeek Harness"）的升级迁移。
+
+    1. Upgrade 表：登记旧版 UpgradeCode（由产品名派生：uuid v5 / DNS /
+       "<productName>.exe.app.x64"），主模板 MajorUpgrade 调度的
+       RemoveExistingProducts 会在安装新版时自动卸载旧 MSI 产品。
+    2. CaptureLegacyDir（immediate，InstallInitialize 之前）：事务开始前捕获
+       旧版安装目录。必须在此时读取——RemoveExistingProducts 卸载旧产品时会把
+       记录目录的注册表值（HKCU 厂商键 InstallDir、HKLM 卸载键 InstallLocation）
+       一并删除，deferred 阶段已无处可读。捕获结果经 CustomActionData 传递
+       （机制：immediate 动作写 Session.Property("CleanupLegacy")，即同名
+       deferred 动作的 CustomActionData）。
+    3. CleanupLegacy（deferred VBScript，SYSTEM 上下文，InstallFiles 之后）：
+       a) 旧 MSI 升级卸载时模板跳过 RemoveShortcuts（UPGRADINGPRODUCTCODE 条件），
+          遗留孤儿：安装目录内 Uninstall 快捷方式、开始菜单文件夹/根级 .lnk、
+          公共桌面快捷方式；
+       b) MSI 的 Upgrade 表无法卸载旧 NSIS 安装，枚举各用户单元的卸载键静默
+          拉起其卸载器（_?= 不能加引号且须位于命令行末尾）；
+       c) 安装目录清理采用安全语义：只删除已知旧版残留文件（Uninstall 快捷方式、
+          uninstall.exe、主程序 exe），目录仅在其后为空时删除，并保护根目录；
+       d) 清扫各用户自启注册表值与旧厂商键（旧卸载器静默模式不清理）。
+          注意：SYSTEM 上下文中 HKCU 是 SYSTEM 自己的单元，必须枚举 HKEY_USERS
+          逐个用户单元清理；用户快捷方式经 ProfileList 的 ProfileImagePath 定位。
+    LegacyCleanupGroup 占位组件用于确保本 Fragment 被链接进 Product。
+  -->
+  <Fragment>
+    <Upgrade Id="{3F992021-DF3D-5157-93F7-F1AA21DE57E7}">
+      <UpgradeVersion OnlyDetect="no" Minimum="0.0.0" IncludeMinimum="yes" Maximum="99.99.99" IncludeMaximum="yes" Property="LEGACY_DSH_HARNESS_FOUND" />
+    </Upgrade>
+
+    <CustomAction Id="CaptureLegacyDir" Script="vbscript" Execute="immediate" Return="ignore">
+      <![CDATA[
+        Option Explicit
+        Dim reg, sids, sid, keys, k, dn, loc, val, dict
+        Set reg = GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv")
+        Set dict = CreateObject("Scripting.Dictionary")
+        Const HKLM = &H80000002
+        Const HKU = &H80000003
+
+        ' ---- 旧 MSI：HKLM 卸载键的 InstallLocation ----
+        If reg.EnumKey(HKLM, "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", keys) = 0 Then
+          For Each k In keys
+            dn = ""
+            If reg.GetStringValue(HKLM, "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\" & k, "DisplayName", dn) = 0 Then
+              If dn = "DeepSeek Harness" Then
+                loc = ""
+                If reg.GetStringValue(HKLM, "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\" & k, "InstallLocation", loc) = 0 Then
+                  If Trim(loc) <> "" Then dict(Replace(Trim(loc), Chr(34), "")) = True
+                End If
+              End If
+            End If
+          Next
+        End If
+
+        ' ---- 旧 NSIS / 旧 MSI：各用户单元厂商键（NSIS 写默认值，MSI 写 InstallDir）----
+        If reg.EnumKey(HKU, "", sids) = 0 Then
+          For Each sid In sids
+            If Left(sid, 2) = "S-" And InStr(sid, "_Classes") = 0 Then
+              val = ""
+              If reg.GetStringValue(HKU, sid & "\Software\deepseekai\DeepSeek Harness", "", val) = 0 Then
+                If Trim(val) <> "" Then dict(Replace(Trim(val), Chr(34), "")) = True
+              End If
+              val = ""
+              If reg.GetStringValue(HKU, sid & "\Software\deepseekai\DeepSeek Harness", "InstallDir", val) = 0 Then
+                If Trim(val) <> "" Then dict(Replace(Trim(val), Chr(34), "")) = True
+              End If
+            End If
+          Next
+        End If
+
+        ' 写入同名 deferred 动作的 CustomActionData
+        Session.Property("CleanupLegacy") = Join(dict.Keys, ";")
+      ]]>
+    </CustomAction>
+
+    <CustomAction Id="CleanupLegacy" Script="vbscript" Execute="deferred" Impersonate="no" Return="ignore">
+      <![CDATA[
+        Option Explicit
+        Dim sh, fso, reg, sids, sid, val, path, p, pf, un, dir, cap, part
+        Dim dictUn, dictDir
+        Set sh = CreateObject("WScript.Shell")
+        Set fso = CreateObject("Scripting.FileSystemObject")
+        Set reg = GetObject("winmgmts:{impersonationLevel=impersonate}!\\.\root\default:StdRegProv")
+        Set dictUn = CreateObject("Scripting.Dictionary")
+        Set dictDir = CreateObject("Scripting.Dictionary")
+
+        Const HKU = &H80000003
+        Const HKLM = &H80000002
+        Const RUNKEY = "\Software\Microsoft\Windows\CurrentVersion\Run"
+        Const UNKEY = "\Software\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeek Harness"
+
+        ' ---- 0) 接收事务开始前捕获的旧安装目录 ----
+        cap = Session.Property("CustomActionData")
+        If Trim(cap) <> "" Then
+          For Each part In Split(cap, ";")
+            If Trim(part) <> "" Then dictDir(Trim(part)) = True
+          Next
+        End If
+
+        ' ---- 1) 逐用户单元：自启项、厂商键、旧 NSIS 卸载入口、快捷方式 ----
+        If reg.EnumKey(HKU, "", sids) = 0 Then
+          For Each sid In sids
+            If Left(sid, 2) = "S-" And InStr(sid, "_Classes") = 0 Then
+              reg.DeleteValue HKU, sid & RUNKEY, "DeepSeekHarness"
+              reg.DeleteValue HKU, sid & RUNKEY, "DeepSeek Harness"
+              reg.DeleteKey HKU, sid & "\Software\deepseekai\DeepSeek Harness"
+              If reg.GetStringValue(HKU, sid & UNKEY, "UninstallString", val) = 0 And val <> "" Then
+                If InStr(LCase(val), "msiexec") = 0 Then dictUn(val) = True
+              End If
+              If reg.GetStringValue(HKU, sid & "\Software\deepseekai\DeepSeek Harness", "", val) = 0 And Trim(val) <> "" Then
+                dictDir(Replace(Trim(val), Chr(34), "")) = True
+              End If
+              If reg.GetStringValue(HKU, sid & "\Software\deepseekai\DeepSeek Harness", "InstallDir", val) = 0 And Trim(val) <> "" Then
+                dictDir(Replace(Trim(val), Chr(34), "")) = True
+              End If
+              If reg.GetStringValue(HKLM, "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" & sid, "ProfileImagePath", path) = 0 And path <> "" Then
+                On Error Resume Next
+                p = sh.ExpandEnvironmentStrings(path) & "\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\DeepSeek Harness"
+                If fso.FolderExists(p) Then fso.DeleteFolder p, True
+                ' NSIS 无开始菜单文件夹时在 Programs 根直接创建 .lnk 文件
+                p = p & ".lnk"
+                If fso.FileExists(p) Then fso.DeleteFile p, True
+                p = sh.ExpandEnvironmentStrings(path) & "\Desktop\DeepSeek Harness.lnk"
+                If fso.FileExists(p) Then fso.DeleteFile p, True
+                On Error GoTo 0
+              End If
+            End If
+          Next
+        End If
+
+        ' ---- 2) perMachine 的旧 NSIS（HKLM 卸载键与厂商键）----
+        val = ""
+        If reg.GetStringValue(HKLM, "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeek Harness", "UninstallString", val) = 0 And val <> "" Then
+          If InStr(LCase(val), "msiexec") = 0 Then dictUn(val) = True
+        End If
+        reg.DeleteKey HKLM, "SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\DeepSeek Harness"
+        reg.DeleteKey HKLM, "SOFTWARE\deepseekai\DeepSeek Harness"
+
+        ' ---- 3) 静默运行旧 NSIS 卸载器（升级卸载管不到它们）----
+        For Each un In dictUn.Keys
+          dir = fso.GetParentFolderName(Replace(un, Chr(34), ""))
+          If fso.FileExists(dir & "\uninstall.exe") Then
+            ' 注意 _?= 不能加引号（NSIS 取命令行剩余部分），且须位于末尾
+            sh.Run Chr(34) & dir & "\uninstall.exe" & Chr(34) & " /S _?=" & dir, 0, True
+          End If
+          dictDir(dir) = True
+        Next
+        If reg.EnumKey(HKU, "", sids) = 0 Then
+          For Each sid In sids
+            If Left(sid, 2) = "S-" And InStr(sid, "_Classes") = 0 Then
+              reg.DeleteKey HKU, sid & UNKEY
+            End If
+          Next
+        End If
+
+        ' ---- 4) 旧安装目录清理（含升级卸载跳过 RemoveShortcuts 的孤儿）----
+        pf = sh.ExpandEnvironmentStrings("%ProgramW6432%")
+        If InStr(pf, "%") > 0 Then pf = sh.ExpandEnvironmentStrings("%ProgramFiles%")
+        dictDir(pf & "\DeepSeek Harness") = True
+        For Each dir In dictDir.Keys
+          CleanDir dir
+        Next
+        On Error Resume Next
+        p = sh.SpecialFolders("AllUsersStartMenu") & "\Programs\DeepSeek Harness"
+        If fso.FolderExists(p) Then fso.DeleteFolder p, True
+        p = p & ".lnk"
+        If fso.FileExists(p) Then fso.DeleteFile p, True
+        p = sh.SpecialFolders("AllUsersDesktop") & "\DeepSeek Harness.lnk"
+        If fso.FileExists(p) Then fso.DeleteFile p, True
+        On Error GoTo 0
+
+        ' 安全清理安装目录：只删已知旧版残留文件，目录仅在其后为空时删除
+        Sub CleanDir(d)
+          Dim fld
+          If d = "" Then Exit Sub
+          d = Replace(Trim(d), Chr(34), "")
+          If Right(d, 1) = "\" Then d = Left(d, Len(d) - 1)
+          If Len(d) < 4 Then Exit Sub ' 根目录（如 D:\）保护，绝不递归删除
+          On Error Resume Next
+          ' 旧 MSI 升级卸载跳过 RemoveShortcuts 遗留的孤儿快捷方式
+          p = d & "\Uninstall DeepSeek Harness.lnk"
+          If fso.FileExists(p) Then fso.DeleteFile p, True
+          ' 旧 NSIS 卸载器 _?= 模式下无法删除自身
+          p = d & "\uninstall.exe"
+          If fso.FileExists(p) Then fso.DeleteFile p, True
+          ' 主程序兜底（旧卸载异常时残留）
+          p = d & "\deepseek-harness-desktop.exe"
+          If fso.FileExists(p) Then fso.DeleteFile p, True
+          If fso.FolderExists(d) Then
+            Set fld = fso.GetFolder(d)
+            If fld.Files.Count = 0 And fld.SubFolders.Count = 0 Then fso.DeleteFolder d, True
+          End If
+          On Error GoTo 0
+        End Sub
+      ]]>
+    </CustomAction>
+
+    <InstallExecuteSequence>
+      <!-- 捕获必须早于 InstallInitialize：RemoveExistingProducts 随后即卸载旧产品
+           并删除记录其安装目录的注册表值 -->
+      <Custom Action="CaptureLegacyDir" Before="InstallInitialize">NOT REMOVE</Custom>
+      <!-- 清理排在 InstallFiles 之后：此时 RemoveExistingProducts 已卸载旧 MSI 产品 -->
+      <Custom Action="CleanupLegacy" After="InstallFiles">NOT REMOVE</Custom>
+    </InstallExecuteSequence>
+
+    <ComponentGroup Id="LegacyCleanupGroup">
+      <Component Id="LegacyCleanupMarker" Directory="TARGETDIR" Guid="{BDE4B963-AF01-4EC0-8ABE-920CADB4EFAF}">
+        <RegistryValue Root="HKCU" Key="Software\deepseekai\DSH Desktop" Name="LegacyMigrated" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

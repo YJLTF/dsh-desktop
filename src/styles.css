@@ -263,6 +263,22 @@ body {
   border-radius: 4px;
   font-size: 11px;
 }
+.banner .btn-update {
+  margin-left: auto;
+  background: var(--orange);
+  border-color: var(--orange);
+  color: #1a1a1a;
+  font-size: 12px;
+  padding: 6px 14px;
+}
+.banner .btn-update:hover {
+  background: var(--orange);
+  opacity: 0.88;
+}
+.banner .btn-update:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
 
 input[type="text"],
 input[type="number"] {

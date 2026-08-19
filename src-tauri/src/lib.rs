@@ -106,7 +106,7 @@ pub async fn open_harness_window_checked(handle: &AppHandle) {
         "harness-ui",
         WebviewUrl::External(url::Url::parse(&dsh_url).expect("dsh URL 合法")),
     )
-    .title("DeepSeek Harness")
+    .title("DSH Desktop")
     .inner_size(1280.0, 840.0)
     .min_inner_size(720.0, 480.0)
     .on_navigation(|url| {
@@ -319,6 +319,7 @@ pub fn run() {
             process::validate_dsh_path,
             // 版本
             version::check_for_updates,
+            version::update_dsh,
             // 代理
             proxy::start_proxy,
             proxy::stop_proxy,

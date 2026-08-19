@@ -1,13 +1,18 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-use crate::process::{self, DshVersion, Resolution};
+use crate::process::{self, DshState, DshVersion, Resolution};
 use crate::settings;
 use crate::APP_HANDLE;
 
 const REGISTRY_LATEST: &str = "https://registry.npmjs.org/@deepseek-ai%2Fdsh/latest";
+const PKG_SPEC: &str = "@deepseek-ai/dsh@latest";
+
+/// 一键更新防重入标志：npm 安装可达分钟级，期间禁止重复触发。
+static UPDATING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
 struct NpmLatest {
@@ -104,6 +109,101 @@ pub async fn check_for_updates(handle: AppHandle) -> Result<DshVersion, String> 
     Ok(info)
 }
 
+/// 推送更新进度到前端（message 直接用作按钮文案）。
+fn emit_progress(handle: &AppHandle, message: &str) {
+    #[derive(Clone, Serialize)]
+    struct UpdateProgress<'a> {
+        message: &'a str,
+    }
+    let _ = handle.emit("update-progress", UpdateProgress { message });
+}
+
+/// 一键更新：`npm install -g @deepseek-ai/dsh@latest`。
+/// 仅作用于全局安装来源；自定义路径 / 本地 node_modules 无法安全地自动替换
+/// （安装目录可能不可写，或根本不在 npm 管辖内），返回错误提示手动升级。
+#[tauri::command]
+pub async fn update_dsh(
+    handle: AppHandle,
+    state: tauri::State<'_, DshState>,
+) -> Result<DshVersion, String> {
+    if UPDATING.swap(true, Ordering::SeqCst) {
+        return Err("已有更新正在进行，请稍候".into());
+    }
+    let result = run_update(&handle, &state).await;
+    UPDATING.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn run_update(
+    handle: &AppHandle,
+    state: &tauri::State<'_, DshState>,
+) -> Result<DshVersion, String> {
+    let settings = settings::current(handle);
+    let resolution = process::resolve_dsh(&settings.dsh_custom_path).await;
+
+    match &resolution {
+        Resolution::Node { source, .. } | Resolution::Executable { source, .. } => {
+            if source != "全局安装" {
+                return Err(format!(
+                    "当前 dsh 来源为“{source}”，一键更新仅支持全局安装的 dsh，请手动升级"
+                ));
+            }
+        }
+        Resolution::NotFound { message } => return Err(message.clone()),
+    }
+
+    let npm = process::npm_exe().ok_or(
+        "未找到 npm，无法自动更新。请安装 Node.js 后重试，或手动运行 npm install -g @deepseek-ai/dsh",
+    )?;
+
+    // 更新期间停止运行中的 dsh：既避免文件替换冲突，也确保重启后加载的是新版本。
+    let was_running = state.is_running();
+    if was_running {
+        emit_progress(handle, "正在停止 dsh…");
+        let _ = process::stop_dsh(handle.clone(), state.clone()).await;
+    }
+
+    emit_progress(handle, "正在下载并安装新版本…");
+    let mut cmd = tokio::process::Command::new(&npm);
+    cmd.args(["install", "-g", PKG_SPEC])
+        .stdin(std::process::Stdio::null());
+    // GUI 子系统拉起 npm.cmd 必须隐藏终端窗口。
+    #[cfg(windows)]
+    cmd.creation_flags(process::CREATE_NO_WINDOW);
+
+    let output = tokio::time::timeout(Duration::from_secs(600), cmd.output())
+        .await
+        .map_err(|_| "npm 安装超时（10 分钟），请检查网络后重试".to_string())?
+        .map_err(|e| format!("执行 npm 失败：{e}"))?;
+
+    if !output.status.success() {
+        // npm 安装失败时旧包通常完好，尽量恢复 dsh 运行。
+        if was_running {
+            emit_progress(handle, "安装失败，正在恢复 dsh…");
+            let _ = process::start_dsh(handle.clone(), state.clone()).await;
+        }
+        let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let tail: String = text.chars().rev().take(200).collect();
+        return Err(format!("npm 安装失败：{}", tail.chars().rev().collect::<String>()));
+    }
+
+    if was_running {
+        emit_progress(handle, "正在以新版本重启 dsh…");
+        process::start_dsh(handle.clone(), state.clone()).await.map_err(|e| {
+            // 新版本已装好，只是重启失败——不算更新失败，但要明确告知。
+            format!("dsh 已更新到最新版，但重启失败：{e}")
+        })?;
+    }
+
+    // 重新汇总版本并刷新横幅、托盘徽标。
+    let info = gather(handle).await;
+    let _ = handle.emit("version-info", info.clone());
+    if let Some(main) = APP_HANDLE.get() {
+        crate::tray::set_update_badge(main, info.update_available);
+    }
+    Ok(info)
+}
+
 /// 启动后台任务，在启用时定期检查更新。
 pub fn spawn_periodic_check() {
     tauri::async_runtime::spawn(async move {
@@ -119,9 +219,9 @@ pub fn spawn_periodic_check() {
                 crate::tray::set_update_badge(handle, info.update_available);
                 if info.update_available {
                     let _ = crate::notify(
-                        "发现 DeepSeek Harness 新版本",
+                        "发现 DSH 新版本",
                         &format!(
-                            "dsh {} 已发布（当前版本 {}）。升级命令：npm install -g @deepseek-ai/dsh",
+                            "dsh {} 已发布（当前版本 {}）。打开控制面板，点击“立即更新”即可升级。",
                             info.latest.as_deref().unwrap_or("?"),
                             info.installed.as_deref().unwrap_or("?")
                         ),

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-DeepSeek Harness 桌面客户端的开发指南与注意事项。功能特性见 [README.md](README.md)。
+DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [README.md](README.md)。
 
 ## 构建 / 测试命令
 
@@ -25,8 +25,25 @@ DeepSeek Harness 桌面客户端的开发指南与注意事项。功能特性见
   - `tray.rs` —— 系统托盘图标及右键菜单、更新徽标图标切换。
   - `settings.rs` —— 存放于用户配置目录的 JSON 配置（`settings::SettingsState`），损坏时备份 `.bak` 回退默认。
   - `autostart.rs` —— 开机自启动（HKCU Run 注册表，经 `reg.exe` 实现，无额外 crate 依赖）。
+- `src-tauri/nsis/installer-hooks.nsh` —— NSIS 安装钩子：扫描注册表静默卸载旧版 DeepSeek Harness（NSIS / MSI 安装均可识别）。
+- `src-tauri/msi/legacy-upgrade.wxs` —— WiX 片段：Upgrade 表登记旧版 UpgradeCode，MSI 安装时自动卸载旧产品。
 
 ## 开发注意事项
+
+### 旧版（DeepSeek Harness）迁移
+- **productName 变更会导致两套安装器都把新版视为全新应用**（NSIS 卸载键、MSI UpgradeCode 均由产品名派生），旧版卸载迁移依赖三处：
+  1. NSIS 钩子（`nsis/installer-hooks.nsh`）按 `DisplayName = "DeepSeek Harness"` 扫描 HKCU/HKLM（64/32 位视图），MSI 走 `msiexec /x {GUID} /qn`（失败退交互式），NSIS 走 `uninstall.exe /S _?=目录`；
+  2. WiX 片段（`msi/legacy-upgrade.wxs`）登记旧 UpgradeCode = `uuid v5(DNS, "DeepSeek Harness.exe.app.x64")` = `{3F992021-DF3D-5157-93F7-F1AA21DE57E7}`，靠主模板 `MajorUpgrade` 调度的 `RemoveExistingProducts` 生效；占位组件 `LegacyCleanupGroup` 仅用于把片段链接进 Product，勿删；
+  3. `settings.rs::migrate_legacy_settings` 迁移用户配置。
+- **MSI 升级路径的孤儿清理靠片段中的 `CleanupLegacy` VBScript 动作**（deferred、`Impersonate="no"` 即 SYSTEM 上下文，排在 `InstallFiles` 后），覆盖：
+  - 旧 MSI 升级卸载时主模板跳过 `RemoveShortcuts`（`Installed AND NOT UPGRADINGPRODUCTCODE` 条件，为同名升级保留快捷方式）遗留的孤儿：安装目录内 Uninstall 快捷方式、开始菜单（文件夹与根级 .lnk 两种形态）、公共桌面快捷方式；
+  - 旧 **NSIS** 安装（Upgrade 表只认 Windows Installer 产品，管不到它）：枚举各用户单元的卸载键静默拉起 `uninstall.exe /S _?=目录`，再清残留；
+  - 各用户自启值与厂商键：**SYSTEM 上下文的 HKCU 是 SYSTEM 自己的单元**，必须枚举 `HKEY_USERS\<SID>` 逐单元清理，用户快捷方式经 `ProfileList\ProfileImagePath` 定位。
+- **NSIS `_?=` 的值绝不能加引号**（即使路径含空格）：NSIS 取命令行剩余部分作 `$INSTDIR`，引号会混入路径导致旧卸载器内所有删除操作静默失败（曾引发“只删了 uninstall.exe”的实测问题）。钩子内也不可引用 `$PassiveMode` 等主脚本 `Var`——钩子在 `Var` 声明之前被 include，编译期不可见（unknown variable 警告），需用 `${Silent}` 等编译期标志替代。
+- 旧卸载器静默模式下不清理：开机自启值 `DeepSeekHarness`（autostart.rs 实际值名，与卸载器按产品名清理的 `DeepSeek Harness` 不一致）与厂商键 `HKCU\Software\deepseekai\DeepSeek Harness`（仅勾选“删除应用数据”才清），均由钩子兜底清扫。
+- **旧版自定义安装目录靠 `CaptureLegacyDir`（immediate，`Before="InstallInitialize"`）捕获**：记录旧目录的注册表值（HKCU 厂商键 InstallDir / HKLM 卸载键 InstallLocation）会被 `RemoveExistingProducts` 随旧产品一起删除，deferred 阶段已读不到。捕获结果写入 `Session.Property("CleanupLegacy")`（同名 deferred 动作的 CustomActionData）传递。
+- **安装目录清理是安全语义**：只删已知残留文件（`Uninstall DeepSeek Harness.lnk`、`uninstall.exe`、旧主程序 exe），目录仅在其后为空时删除，且 `Len < 4` 根目录保护——用户可能把应用装在自选目录甚至盘符根附近，绝不能整目录强删。父目录（用户手工创建的层级）也不向上清理。
+- 再次更名产品时需同步更新以上三处（升级代码算法：`uuid v5(DNS, "<新名>.exe.app.x64")`）。
 
 ### 版本号发布
 - 版本号出现在 **5 处**，发布时需同步修改：`package.json`、`package-lock.json`（两处）、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`；`src-tauri/Cargo.lock` 由 `cargo check` 自动同步。安装包版本与面板“桌面端 v”显示均取自 `tauri.conf.json`。
@@ -49,6 +66,11 @@ DeepSeek Harness 桌面客户端的开发指南与注意事项。功能特性见
 - **外部数据进 innerHTML 前必须 `esc()` 转义**（版本号等来自 npm registry）。新增模板拼接时遵循。
 - **前端 init 逐项容错**：单项 `invoke` 失败不应中断初始化（否则事件监听挂不上、页面假死）；新增初始化调用保持 try/catch 包裹。
 - **`Settings` 结构变更**：新字段必须加 `#[serde(default ...)]` 并同步 `Default` 实现、前端 `Settings` 接口与 `collectSettings`，否则旧配置文件反序列化失败会触发 `.bak` 备份回退。
+
+### dsh 一键更新（version.rs::update_dsh）
+- **仅支持"全局安装"来源**：自定义路径 / 本地 node_modules（安装目录可能不可写，或不在 npm 管辖内）会拒绝并提示手动升级，判定依据是 `Resolution.source == "全局安装"`。
+- **更新流程**：停 dsh（若运行中）→ `npm install -g @deepseek-ai/dsh@latest`（CREATE_NO_WINDOW、10 分钟超时）→ 恢复运行 → `gather()` 刷新横幅与托盘徽标；npm 失败时旧包通常完好，尽量恢复旧版运行后再报错。
+- **防重入**：`UPDATING` AtomicBool（npm 安装可达分钟级）；阶段进度经 `update-progress` 事件推送，message 直接用作前端按钮文案。
 
 ### 其他
 - **CSP 已收紧**（`tauri.conf.json`）：新增需要外部连接/内联脚本的功能时须同步调整 `security.csp`。

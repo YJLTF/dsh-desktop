@@ -196,7 +196,7 @@ fn unauthorized_html() -> Response {
 <body style="font-family:system-ui,'Segoe UI',sans-serif;display:flex;height:100vh;margin:0;align-items:center;justify-content:center;background:#0f172a;color:#e2e8f0">
 <div style="text-align:center">
 <h1>401 — 未授权</h1>
-<p>访问该 DeepSeek Harness 端点需要有效的访问令牌。<br>请在 URL 后追加 <code>?token=&lt;令牌&gt;</code>，或从桌面应用中打开。</p>
+<p>访问该 DSH 端点需要有效的访问令牌。<br>请在 URL 后追加 <code>?token=&lt;令牌&gt;</code>，或从桌面应用中打开。</p>
 </div></body></html>"#;
     (
         StatusCode::UNAUTHORIZED,
@@ -480,7 +480,7 @@ pub async fn start_proxy(
         let _ = crate::notify(
             "局域网代理已启用",
             &format!(
-                "若其他设备无法访问，请在 Windows 防火墙中放行端口 {bound_port}（或允许 DeepSeek Harness 通过防火墙）。"
+                "若其他设备无法访问，请在 Windows 防火墙中放行端口 {bound_port}（或允许 DSH Desktop 通过防火墙）。"
             ),
         );
     }

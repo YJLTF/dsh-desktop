@@ -162,7 +162,7 @@ const NPM_FILES: &[&str] = &["npm"];
 /// 解析 npm 可执行文件路径。GUI 子系统应用继承自 Shell 的 PATH 可能缺失用户级 npm
 /// 目录（Win10 上“已安装全局包却找不到 dsh”的常见原因）：优先用 node 同目录的 npm，
 /// 再查 PATH，最后回退到 npm 用户级前缀（Windows 为 %APPDATA%\npm，由环境变量推导）。
-fn npm_exe() -> Option<PathBuf> {
+pub(crate) fn npm_exe() -> Option<PathBuf> {
     if let Some(node) = node_exe() {
         if let Some(dir) = node.parent() {
             for name in NPM_FILES {

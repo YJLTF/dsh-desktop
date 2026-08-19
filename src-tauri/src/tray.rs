@@ -40,7 +40,7 @@ pub fn build_tray(app: &App) {
         None => {
             tauri::tray::TrayIconBuilder::with_id("main-tray")
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("DeepSeek Harness")
+                .tooltip("DSH Desktop")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .build(app)

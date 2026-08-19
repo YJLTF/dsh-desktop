@@ -9,6 +9,13 @@ use tauri::{Emitter, Manager};
 use crate::APP_HANDLE;
 
 const SETTINGS_FILE: &str = "settings.json";
+const LEGACY_APP_NAME: &str = "DeepSeek Harness";
+
+/// 旧版（DeepSeek Harness）应用的配置目录。
+fn legacy_config_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("com", "deepseekai", LEGACY_APP_NAME)
+        .map(|d| d.config_dir().to_path_buf())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -88,7 +95,7 @@ impl Default for Settings {
 impl Settings {
     /// 解析 settings.json 在用户配置目录中的位置。
     pub fn config_dir() -> PathBuf {
-        let base = directories::ProjectDirs::from("com", "deepseekai", "DeepSeek Harness")
+        let base = directories::ProjectDirs::from("com", "deepseekai", "DSH Desktop")
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         base
@@ -98,9 +105,58 @@ impl Settings {
         Self::config_dir().join(SETTINGS_FILE)
     }
 
+    /// 应用由 DeepSeek Harness 改名为 DSH Desktop 后的一次性迁移：
+    /// 若新目录尚无 settings.json 而旧目录存在，先把旧 settings.json
+    /// 复制到新目录，随后删除整个旧应用目录。复制失败时保留旧目录，
+    /// 留待下次启动重试。
+    fn migrate_legacy_settings() {
+        let new_path = Self::settings_path();
+        let Some(old_config) = legacy_config_dir() else {
+            return;
+        };
+        let Some(old_app_dir) = old_config.parent() else {
+            return;
+        };
+        // 删除目标必须名为旧应用名，防止误删意外位置。
+        if old_app_dir.file_name().and_then(|n| n.to_str()) != Some(LEGACY_APP_NAME) {
+            return;
+        }
+        if !old_app_dir.is_dir() {
+            return;
+        }
+        let old_path = old_config.join(SETTINGS_FILE);
+        if !new_path.exists() && old_path.exists() {
+            if let Some(parent) = new_path.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    log::error!("迁移旧设置失败：无法创建新配置目录（{e}）");
+                    return;
+                }
+            }
+            match fs::copy(&old_path, &new_path) {
+                Ok(_) => log::info!(
+                    "已迁移旧设置：{} -> {}",
+                    old_path.display(),
+                    new_path.display()
+                ),
+                Err(e) => {
+                    log::error!(
+                        "迁移旧设置失败（{e}）：{} -> {}",
+                        old_path.display(),
+                        new_path.display()
+                    );
+                    return;
+                }
+            }
+        }
+        if let Err(e) = fs::remove_dir_all(old_app_dir) {
+            log::warn!("清理旧配置目录失败（{e}）：{}", old_app_dir.display());
+        }
+    }
+
     /// 从磁盘加载设置；若文件缺失则使用默认值创建，
     /// 并确保代理访问令牌已生成。
     pub fn load() -> io::Result<Self> {
+        Self::migrate_legacy_settings();
         let path = Self::settings_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
