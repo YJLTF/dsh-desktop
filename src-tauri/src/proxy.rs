@@ -221,7 +221,7 @@ const POLYFILL_SCRIPT: &str = concat!(
     r#"b[6]=(b[6]&0x0f)|0x40;b[8]=(b[8]&0x3f)|0x80;"#,
     r#"var h="";for(var i=0;i<16;i++){h+=b[i].toString(16).padStart(2,"0")}"#,
     r#"return h.slice(0,8)+"-"+h.slice(8,12)+"-"+h.slice(12,16)+"-"+h.slice(16,20)+"-"+h.slice(20)"#,
-    r#"}})();</script>"#
+    r#"}}})();</script>"#
 );
 
 /// HTML 注入的防御性长度上限：超过则放弃改写原样返回（正常页面仅数 KB），
@@ -312,6 +312,10 @@ async fn forward_http(
     let url = format!("{}{}", state.target, path);
 
     let mut upstream_req = state.client.request(parts.method.clone(), &url);
+    // dsh 上游按 Origin 做同源校验：局域网代理源（http://<内网IP>:<端口>）与上游
+    // 自身源不同，原样转发会被 403 拒绝（POST /api/* 全挂）。改写为上游源即可
+    // 与直连访问等价；referer 同理剥离，上游不依赖它。
+    let had_origin = parts.headers.contains_key("origin");
     for (name, value) in parts.headers.iter() {
         if is_hop(name.as_str()) {
             continue;
@@ -321,9 +325,15 @@ async fn forward_http(
         if name.as_str() == "accept-encoding" {
             continue;
         }
+        if name.as_str() == "origin" || name.as_str() == "referer" {
+            continue;
+        }
         upstream_req = upstream_req.header(name, value);
     }
     upstream_req = upstream_req.header("host", state.target.as_str());
+    if had_origin {
+        upstream_req = upstream_req.header("origin", state.target.as_str());
+    }
     // 流式透传请求体：整体缓冲会让大附件上传时代理内存峰值与请求体等大。
     // GET/HEAD 按 HTTP 语义不带请求体，跳过（分块空体会让部分服务端拒绝）。
     if !matches!(parts.method.as_str(), "GET" | "HEAD") {
@@ -638,11 +648,41 @@ mod tests {
     }
 
     #[test]
-    fn polyfill_generates_valid_v4_uuid_shape() {
+    fn polyfill_script_fragments_present() {
         // 垫片脚本本身在浏览器执行；这里校验其文本结构关键片段不缺失。
         for fragment in ["getRandomValues", "crypto.randomUUID=function", "0x40", "0x80", "<script>"] {
             assert!(POLYFILL_SCRIPT.contains(fragment), "垫片缺少片段：{fragment}");
         }
+    }
+
+    /// 垫片脚本的 ()/{}/[] 必须配平——脚本若有语法错误，解析阶段即死、
+    /// 静默不执行，页面会原样复现 "crypto.randomUUID is not a function"
+    /// （0.1.3 首版垫片就因少一个 `}` 栽在这里，浏览器只报
+    /// "Uncaught SyntaxError: Unexpected token ')'"）。
+    /// 脚本内字符串字面量不含括号字符，朴素计数即足够。
+    #[test]
+    fn polyfill_script_brackets_balanced() {
+        let js = POLYFILL_SCRIPT
+            .strip_prefix("<script>")
+            .and_then(|s| s.strip_suffix("</script>"))
+            .expect("垫片应包裹在 script 标签内");
+        let mut paren = 0i32;
+        let mut brace = 0i32;
+        let mut bracket = 0i32;
+        for c in js.chars() {
+            match c {
+                '(' => paren += 1,
+                ')' => paren -= 1,
+                '{' => brace += 1,
+                '}' => brace -= 1,
+                '[' => bracket += 1,
+                ']' => bracket -= 1,
+                _ => {}
+            }
+            assert!(paren >= 0 && brace >= 0 && bracket >= 0, "垫片脚本括号提前闭合");
+        }
+        assert_eq!((paren, brace, bracket), (0, 0, 0), "垫片脚本括号必须配平");
+        assert!(js.ends_with("})();"), "垫片应以立即执行调用收尾");
     }
 
     #[test]
