@@ -206,6 +206,59 @@ fn unauthorized_html() -> Response {
         .into_response()
 }
 
+/// 注入到经代理 HTML 的垫片脚本。
+///
+/// `crypto.randomUUID` 是安全上下文（HTTPS / localhost）专属 API：局域网代理以
+/// `http://<内网IP>:<端口>` 明文访问，页面处于非安全上下文，浏览器不暴露该方法；
+/// 而 dsh 前端为每条 RPC 生成 ID 都要调用它（如打开工作区文件夹），随即抛出
+/// "crypto.randomUUID is not a function"。`crypto.getRandomValues` 在非安全
+/// 上下文同样可用，据此实现 RFC 4122 v4 UUID 垫片；已存在原生实现时不动。
+const POLYFILL_SCRIPT: &str = concat!(
+    r#"<script>(function(){"#,
+    r#"if(typeof crypto==="object"&&crypto&&!crypto.randomUUID){"#,
+    r#"crypto.randomUUID=function(){"#,
+    r#"var b=new Uint8Array(16);crypto.getRandomValues(b);"#,
+    r#"b[6]=(b[6]&0x0f)|0x40;b[8]=(b[8]&0x3f)|0x80;"#,
+    r#"var h="";for(var i=0;i<16;i++){h+=b[i].toString(16).padStart(2,"0")}"#,
+    r#"return h.slice(0,8)+"-"+h.slice(8,12)+"-"+h.slice(12,16)+"-"+h.slice(16,20)+"-"+h.slice(20)"#,
+    r#"}}})();</script>"#
+);
+
+/// HTML 注入的防御性长度上限：超过则放弃改写原样返回（正常页面仅数 KB），
+/// 避免上游异常超大响应在代理内整包占用内存。
+const HTML_INJECT_LIMIT: usize = 4 * 1024 * 1024;
+
+/// 判断响应是否为可安全改写的 HTML 文档：
+/// content-type 为 `text/html` 且响应体未压缩（identity）——压缩体无法直接注入文本。
+fn is_plain_html(headers: &reqwest::header::HeaderMap) -> bool {
+    let html = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.to_ascii_lowercase().starts_with("text/html"));
+    let identity = headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map_or(true, |v| v.eq_ignore_ascii_case("identity"));
+    html && identity
+}
+
+/// 将垫片脚本注入 HTML 文档 `<head>` 开始标签之后（退而求其次 `<html>`），
+/// 保证它先于页面内所有脚本执行；找不到合法插入点或超限时返回 `None`（不改写）。
+fn inject_polyfill(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > HTML_INJECT_LIMIT {
+        return None;
+    }
+    let html = std::str::from_utf8(bytes).ok()?;
+    let lower = html.to_ascii_lowercase();
+    let at = ["<head", "<html"].iter().find_map(|tag| {
+        lower
+            .find(tag)
+            .and_then(|i| lower[i..].find('>').map(|g| i + g + 1))
+    })?;
+    // 切点紧随 ASCII '>' 之后，必然是 UTF-8 字符边界。
+    Some(format!("{}{}{}", &html[..at], POLYFILL_SCRIPT, &html[at..]))
+}
+
 /// 兜底处理器：先做令牌鉴权，再进行 HTTP 转发或 WebSocket 隧道。
 async fn proxy_handler(
     State(state): State<ProxyState>,
@@ -249,6 +302,12 @@ async fn proxy_handler(
     resp
 }
 
+/// 从 target（`http://host:port`）提取 Host 头用的纯 authority（`host:port`）。
+/// Host 头带 scheme 是非法值，会让上游的同源校验（`http://<Host>` 拼接比对）失配。
+fn upstream_authority(target: &str) -> &str {
+    target.trim_start_matches("http://").trim_start_matches("https://")
+}
+
 /// 将普通 HTTP 请求转发至上游并以流的方式回传响应。
 async fn forward_http(
     state: ProxyState,
@@ -259,13 +318,33 @@ async fn forward_http(
     let url = format!("{}{}", state.target, path);
 
     let mut upstream_req = state.client.request(parts.method.clone(), &url);
+    // dsh 上游按 Origin 做同源校验：局域网代理源（http://<内网IP>:<端口>）与上游
+    // 自身源不同，原样转发会被 403 拒绝（POST /api/* 全挂）。改写为上游源即可
+    // 与直连访问等价；referer 同理剥离，上游不依赖它。
+    let had_origin = parts.headers.contains_key("origin");
     for (name, value) in parts.headers.iter() {
         if is_hop(name.as_str()) {
             continue;
         }
+        // 剥掉 accept-encoding：上游若返回压缩体，HTML 垫片（见 POLYFILL_SCRIPT）
+        // 将无法注入；代理与 dsh 之间是本机回环，放弃压缩没有实际代价。
+        if name.as_str() == "accept-encoding" {
+            continue;
+        }
+        if name.as_str() == "origin" || name.as_str() == "referer" {
+            continue;
+        }
         upstream_req = upstream_req.header(name, value);
     }
-    upstream_req = upstream_req.header("host", state.target.as_str());
+    // Host 头必须是纯 authority（host:port）：dsh 的同源校验按
+    // `http://<Host头>` 拼出期望源与 Origin 比对，若把带 scheme 的完整
+    // target（"http://127.0.0.1:3080"）当 Host 发出，拼出的期望源变成
+    // "http://http://127.0.0.1:3080"，永远不匹配 → 所有带 Origin 的
+    // POST /api/* 一律 403（实测 host.pickDirectory 即栽在这里）。
+    upstream_req = upstream_req.header("host", upstream_authority(&state.target));
+    if had_origin {
+        upstream_req = upstream_req.header("origin", state.target.as_str());
+    }
     // 流式透传请求体：整体缓冲会让大附件上传时代理内存峰值与请求体等大。
     // GET/HEAD 按 HTTP 语义不带请求体，跳过（分块空体会让部分服务端拒绝）。
     if !matches!(parts.method.as_str(), "GET" | "HEAD") {
@@ -277,9 +356,20 @@ async fn forward_http(
 
     let upstream_resp = upstream_req.send().await?;
     let status = upstream_resp.status();
+    let is_html = is_plain_html(upstream_resp.headers());
     let mut builder = Response::builder().status(status.as_u16());
     if let Some(h) = builder.headers_mut() {
         copy_headers(upstream_resp.headers(), h);
+    }
+
+    // HTML 文档需注入 secure-context 垫片，整包读出改写；其余响应一律流式透传。
+    if is_html {
+        let bytes = upstream_resp.bytes().await?;
+        let body = match inject_polyfill(&bytes) {
+            Some(html) => Body::from(html),
+            None => Body::from(bytes),
+        };
+        return Ok(builder.body(body)?);
     }
 
     let stream = upstream_resp.bytes_stream();
@@ -529,4 +619,102 @@ pub async fn get_proxy_info(
 #[tauri::command]
 pub async fn get_proxy_token(handle: AppHandle) -> Result<String, String> {
     Ok(settings::current(&handle).lan_proxy_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injects_after_head_tag() {
+        let out = inject_polyfill(b"<!doctype html><html><head><title>t</title></head><body></body></html>")
+            .expect("应注入");
+        let head_end = out.find("<title>").unwrap();
+        assert!(out[..head_end].contains(POLYFILL_SCRIPT), "垫片应在 title 之前");
+        assert!(out.ends_with("</html>"), "文档其余部分保持原样");
+        assert!(out.starts_with("<!doctype html>"), "doctype 保持在前");
+    }
+
+    #[test]
+    fn head_tag_match_is_case_insensitive() {
+        let out = inject_polyfill(b"<HTML><HEAD><meta charset='utf-8'></HEAD></HTML>").expect("应注入");
+        assert!(out.contains(&format!("<HEAD>{POLYFILL_SCRIPT}<meta")), "大写标签后应紧跟垫片");
+    }
+
+    #[test]
+    fn falls_back_to_html_tag_without_head() {
+        let out = inject_polyfill(b"<html><body><p>x</p></body></html>").expect("应注入");
+        assert!(
+            out.starts_with(&format!("<html>{POLYFILL_SCRIPT}<body>")),
+            "无 head 时应紧随 <html> 注入"
+        );
+    }
+
+    #[test]
+    fn skips_non_html_or_oversized() {
+        assert_eq!(inject_polyfill(b"plain text, no tags"), None);
+        assert_eq!(inject_polyfill(b"\xff\xfe<html>"), None, "非 UTF-8 不改写");
+        let oversized = vec![b'<'; HTML_INJECT_LIMIT + 1];
+        assert_eq!(inject_polyfill(&oversized), None, "超上限不改写");
+    }
+
+    #[test]
+    fn polyfill_script_fragments_present() {
+        // 垫片脚本本身在浏览器执行；这里校验其文本结构关键片段不缺失。
+        for fragment in ["getRandomValues", "crypto.randomUUID=function", "0x40", "0x80", "<script>"] {
+            assert!(POLYFILL_SCRIPT.contains(fragment), "垫片缺少片段：{fragment}");
+        }
+    }
+
+    /// 垫片脚本的 ()/{}/[] 必须配平——脚本若有语法错误，解析阶段即死、
+    /// 静默不执行，页面会原样复现 "crypto.randomUUID is not a function"
+    /// （0.1.3 首版垫片就因少一个 `}` 栽在这里，浏览器只报
+    /// "Uncaught SyntaxError: Unexpected token ')'"）。
+    /// 脚本内字符串字面量不含括号字符，朴素计数即足够。
+    #[test]
+    fn polyfill_script_brackets_balanced() {
+        let js = POLYFILL_SCRIPT
+            .strip_prefix("<script>")
+            .and_then(|s| s.strip_suffix("</script>"))
+            .expect("垫片应包裹在 script 标签内");
+        let mut paren = 0i32;
+        let mut brace = 0i32;
+        let mut bracket = 0i32;
+        for c in js.chars() {
+            match c {
+                '(' => paren += 1,
+                ')' => paren -= 1,
+                '{' => brace += 1,
+                '}' => brace -= 1,
+                '[' => bracket += 1,
+                ']' => bracket -= 1,
+                _ => {}
+            }
+            assert!(paren >= 0 && brace >= 0 && bracket >= 0, "垫片脚本括号提前闭合");
+        }
+        assert_eq!((paren, brace, bracket), (0, 0, 0), "垫片脚本括号必须配平");
+        assert!(js.ends_with("})();"), "垫片应以立即执行调用收尾");
+    }
+
+    #[test]
+    fn upstream_authority_strips_scheme() {
+        assert_eq!(upstream_authority("http://127.0.0.1:3080"), "127.0.0.1:3080");
+        assert_eq!(upstream_authority("https://example.com:9443"), "example.com:9443");
+        assert_eq!(upstream_authority("127.0.0.1:3080"), "127.0.0.1:3080");
+    }
+
+    #[test]
+    fn detects_plain_html_responses() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::CONTENT_TYPE, "text/html; charset=utf-8".parse().unwrap());
+        assert!(is_plain_html(&headers));
+        headers.insert(reqwest::header::CONTENT_ENCODING, "identity".parse().unwrap());
+        assert!(is_plain_html(&headers), "identity 视为未压缩");
+
+        headers.insert(reqwest::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        assert!(!is_plain_html(&headers), "压缩体不可注入");
+        headers.remove(reqwest::header::CONTENT_ENCODING);
+        headers.insert(reqwest::header::CONTENT_TYPE, "text/javascript".parse().unwrap());
+        assert!(!is_plain_html(&headers), "仅 text/html 可注入");
+    }
 }

@@ -58,7 +58,10 @@ DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [RE
 - **启停必须持 `ProxyRuntime::op_lock`**：开机自动恢复与用户手动开关可能并发，分段锁（shutdown/join）会造成双绑定。新增修改代理生命周期的命令时先取该锁。
 - **端口可能回退**：Win10 上 Hyper-V/WSL/VPN 会随机保留端口段（bind 报 WSAEACCES 10013），`bind_listener` 失败重试后回退系统分配端口。因此**实际监听端口以 `ProxyRuntime::port` 记录为准**，`get_proxy_info` 已按此回报；不要假设监听端口等于 `settings.lan_proxy_port`。
 - **令牌是启动时克隆进 `ProxyState` 的**：修改令牌（`regenerate_token`）必须重启运行中的代理才生效，否则新令牌被 401、旧令牌继续可用。调整令牌相关逻辑时保持这一联动。
-- **请求体流式透传**：`forward_http` 用 `BodyStream` + `wrap_stream` 转发请求体（GET/HEAD 跳过），不要改回 `collect().to_bytes()` 整包缓冲——大附件上传时内存峰值会与请求体等大。
+- **请求体流式透传**：`forward_http` 用 `BodyStream` + `wrap_stream` 转发请求体（GET/HEAD 跳过），不要改回 `collect().to_bytes()` 整包缓冲——大附件上传时内存峰值会与请求体等大。响应侧同理：**只有 `text/html` 且未压缩的响应**会整包缓冲注入垫片（见下条），其余响应保持 `bytes_stream()` 流式，勿扩大缓冲范围。
+- **HTML 响应注入 secure-context 垫片**：局域网代理是 `http://<内网IP>` 明文访问，页面处于非安全上下文，浏览器不暴露 `crypto.randomUUID`（安全上下文专属），而 dsh 前端每条 RPC 都要用它生成 ID——打开工作区即报 "crypto.randomUUID is not a function"。代理在 `<head>` 后注入基于 `crypto.getRandomValues`（非安全上下文可用）的 v4 UUID 垫片（`POLYFILL_SCRIPT`）。两个联动约束：转发请求时**剥掉 `accept-encoding`**（上游返回压缩 HTML 就无法注入，代理→dsh 是回环无压缩代价）；改写仅限 4 MiB 内的合法 UTF-8 HTML（`inject_polyfill` 找不到 `<head>`/`<html>` 即返回 None 原样透传），不要为了"更早执行"改成无脑前插。
+- **`POLYFILL_SCRIPT` 改动必须过 `polyfill_script_brackets_balanced` 测试**：注入脚本若有语法错误（0.1.3 首版少写一个 `}`），浏览器解析阶段静默死亡（控制台仅一条 "Uncaught SyntaxError"，页面照常渲染），垫片不生效、原错误原样复现——极难排查。改垫片后除跑测试外，务必用 `node --check` 实际解析一遍脚本内容，再用真实浏览器 + 局域网 IP（非安全上下文）端到端验证（无头 Edge + CDP `Runtime.evaluate` 检查 `typeof crypto.randomUUID`）。
+- **`origin` 头必须改写为上游源，且 `host` 头必须是纯 authority**：dsh 对 `POST /api/*` 做同源校验，比对方式是 `Origin === http://<Host头拼接>`。两个坑：（a）局域网代理源（`http://<内网IP>:<端口>`）原样转发会被 **403** 拒绝，`forward_http` 将 `origin` 改写为 `state.target`、剥掉 `referer`；（b）**Host 头带 scheme 是非法值**——若把完整 target（`http://127.0.0.1:3080`）当 Host 发出，上游拼出的期望源是 `http://http://...`，改写了 origin 也照样 403（初版代码即此 bug，被 randomUUID 错误掩盖，实测表现为 `host.pickDirectory` 403）。Host 一律经 `upstream_authority()` 去掉 scheme。排障提示：直连上游（带正确 origin）200、经代理 403 时，先用 curl 对比两种 Host 头格式。
 - **`lan_ip()` 已带 10 秒缓存**（含失败结果缓存），可放心在命令中调用；探测链为多目标 UDP connect → 主机名解析兜底。
 
 ### 设置与前端
