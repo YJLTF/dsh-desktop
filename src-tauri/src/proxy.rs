@@ -302,6 +302,12 @@ async fn proxy_handler(
     resp
 }
 
+/// 从 target（`http://host:port`）提取 Host 头用的纯 authority（`host:port`）。
+/// Host 头带 scheme 是非法值，会让上游的同源校验（`http://<Host>` 拼接比对）失配。
+fn upstream_authority(target: &str) -> &str {
+    target.trim_start_matches("http://").trim_start_matches("https://")
+}
+
 /// 将普通 HTTP 请求转发至上游并以流的方式回传响应。
 async fn forward_http(
     state: ProxyState,
@@ -330,7 +336,12 @@ async fn forward_http(
         }
         upstream_req = upstream_req.header(name, value);
     }
-    upstream_req = upstream_req.header("host", state.target.as_str());
+    // Host 头必须是纯 authority（host:port）：dsh 的同源校验按
+    // `http://<Host头>` 拼出期望源与 Origin 比对，若把带 scheme 的完整
+    // target（"http://127.0.0.1:3080"）当 Host 发出，拼出的期望源变成
+    // "http://http://127.0.0.1:3080"，永远不匹配 → 所有带 Origin 的
+    // POST /api/* 一律 403（实测 host.pickDirectory 即栽在这里）。
+    upstream_req = upstream_req.header("host", upstream_authority(&state.target));
     if had_origin {
         upstream_req = upstream_req.header("origin", state.target.as_str());
     }
@@ -683,6 +694,13 @@ mod tests {
         }
         assert_eq!((paren, brace, bracket), (0, 0, 0), "垫片脚本括号必须配平");
         assert!(js.ends_with("})();"), "垫片应以立即执行调用收尾");
+    }
+
+    #[test]
+    fn upstream_authority_strips_scheme() {
+        assert_eq!(upstream_authority("http://127.0.0.1:3080"), "127.0.0.1:3080");
+        assert_eq!(upstream_authority("https://example.com:9443"), "example.com:9443");
+        assert_eq!(upstream_authority("127.0.0.1:3080"), "127.0.0.1:3080");
     }
 
     #[test]
