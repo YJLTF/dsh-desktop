@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "DeepSeek Harness（dsh）轻量桌面客户端，提供系统托盘驻留、版本升级检测与局域网代理功能。",
   "type": "module",
   "private": true,

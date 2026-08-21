@@ -10,11 +10,29 @@ use tokio::sync::Mutex;
 use std::os::windows::process::CommandExt;
 
 use crate::settings;
+use crate::version;
 
 /// Windows 下 CREATE_NO_WINDOW 标志：GUI 应用拉起控制台程序（node.exe、npm.cmd 等）时
 /// 不为其新建终端窗口，否则安装版每次启动 dsh 都会弹出 node.exe 控制台。
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `dsh web` 的 `--no-open` 选项自 0.1.0-rc.8 起存在（同期引入了启动后自动打开浏览器）。
+/// 旧版本会把该选项当作未知参数，commander 直接报错退出（exit 1），
+/// 因此只有在确认已安装版本支持时才能传递。
+const NO_OPEN_SINCE: &str = "0.1.0-rc.8";
+
+/// 已安装版本是否支持 `--no-open`。版本无法解析时保守返回 false
+/// （最坏情况是浏览器多开一个标签，好过旧版本直接启动失败）。
+fn supports_no_open(version: Option<&str>) -> bool {
+    match (
+        semver::Version::parse(NO_OPEN_SINCE),
+        version.map(semver::Version::parse),
+    ) {
+        (Ok(min), Some(Ok(v))) => v >= min,
+        _ => false,
+    }
+}
 
 /// dsh 入口的解析方式。
 #[derive(Debug, Clone, Serialize)]
@@ -436,20 +454,26 @@ fn kill_if_stale(pid: &str, extra_image: Option<&str>) -> bool {
 }
 
 /// 根据解析得到的入口构建 tokio Command。
-fn build_command(resolution: &Resolution) -> Option<Command> {
-    match resolution {
+/// `no_open`：追加 `--no-open`，阻止 dsh 启动后自动打开系统浏览器
+/// （桌面端在 harness-ui 窗口内承载 UI，不需要再弹浏览器）。
+fn build_command(resolution: &Resolution, no_open: bool) -> Option<Command> {
+    let mut cmd = match resolution {
         Resolution::Node { node, script, .. } => {
             let mut cmd = Command::new(node);
             cmd.arg(script).arg("web");
-            Some(cmd)
+            cmd
         }
         Resolution::Executable { exe, .. } => {
             let mut cmd = Command::new(exe);
             cmd.arg("web");
-            Some(cmd)
+            cmd
         }
-        Resolution::NotFound { .. } => None,
+        Resolution::NotFound { .. } => return None,
+    };
+    if no_open {
+        cmd.arg("--no-open");
     }
+    Some(cmd)
 }
 
 pub fn emit_status(handle: &AppHandle, running: bool) {
@@ -482,7 +506,18 @@ pub async fn start_dsh(
     let resolution = resolve_dsh(&settings.dsh_custom_path).await;
     *state.resolution.lock().await = resolution.clone();
 
-    let mut cmd = build_command(&resolution).ok_or_else(|| match &resolution {
+    // dsh 0.1.0-rc.8 起 `dsh web` 启动后会自动打开系统浏览器，桌面端内嵌了
+    // harness-ui 窗口，无需重复弹页。`--no-open` 仅在新版 dsh 上存在（旧版收到
+    // 未知选项会直接退出），故先取已安装版本再决定是否传递：
+    // 优先从包内 package.json 读取（Node 入口，无子进程开销），自定义可执行
+    // 文件读不到时退回运行 `<入口> --version`。
+    let mut installed = version::installed_version_from_pkg(&resolution);
+    if installed.is_none() {
+        installed = version::installed_version(&resolution).await;
+    }
+    let no_open = supports_no_open(installed.as_deref());
+
+    let mut cmd = build_command(&resolution, no_open).ok_or_else(|| match &resolution {
         Resolution::NotFound { message } => message.clone(),
         _ => "未预期的解析结果".into(),
     })?;
