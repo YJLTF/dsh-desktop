@@ -20,7 +20,7 @@ struct NpmLatest {
 }
 
 /// 通过运行 `<入口> --version` 获取已安装的 dsh 版本号。
-async fn installed_version(resolution: &Resolution) -> Option<String> {
+pub(crate) async fn installed_version(resolution: &Resolution) -> Option<String> {
     let (program, args): (String, Vec<String>) = match resolution {
         Resolution::Node { node, script, .. } => (node.clone(), vec![script.clone(), "--version".into()]),
         Resolution::Executable { exe, .. } => (exe.clone(), vec!["--version".into()]),
@@ -44,7 +44,7 @@ async fn installed_version(resolution: &Resolution) -> Option<String> {
 }
 
 /// 兜底方案：直接从解析得到的 package.json 中读取版本号。
-fn installed_version_from_pkg(resolution: &Resolution) -> Option<String> {
+pub(crate) fn installed_version_from_pkg(resolution: &Resolution) -> Option<String> {
     let script = match resolution {
         Resolution::Node { script, .. } => PathBuf::from(script),
         _ => return None,

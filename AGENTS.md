@@ -53,6 +53,7 @@ DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [RE
 - **还原窗口须先 `unminimize()` 再 `show()`**：Windows 上对最小化窗口 `show()` 是空操作。所有唤起窗口的路径（托盘菜单、二次启动 single-instance）都已遵循；新增唤起路径时同样处理。
 - **npm 查找顺序**：node 同目录 `npm.cmd` → PATH → `%APPDATA%\npm\npm.cmd`；npm 完全不可用时全局目录回退 `%APPDATA%\npm\node_modules`。默认路径检查以 `npm root -g` 动态解析为准（跟随用户自定义 prefix），不要写死绝对路径。
 - **`npm root -g` 必须在 `spawn_blocking` 中执行**：npm 冷启动可达秒级，直接在 async 上下文调用会阻塞 tokio 工作线程。
+- **`dsh web` 以 `--no-open` 启动并按版本门控**：dsh 0.1.0-rc.8 起 `web` 启动后会自动打开系统浏览器，桌面端在 harness-ui 窗口内承载 UI，`start_dsh` 会传 `--no-open` 阻止。该选项旧版不存在，commander 收到未知选项直接 exit 1（启动整体失败），故 `supports_no_open` 按已装版本（≥ 0.1.0-rc.8）判断后才传递；版本探测走 package.json 快路径，自定义可执行文件退回 `<入口> --version` 子进程。
 
 ### 代理模块（proxy.rs）
 - **启停必须持 `ProxyRuntime::op_lock`**：开机自动恢复与用户手动开关可能并发，分段锁（shutdown/join）会造成双绑定。新增修改代理生命周期的命令时先取该锁。
