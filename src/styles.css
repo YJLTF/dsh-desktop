@@ -248,6 +248,8 @@ body {
 .banner .banner-body {
   font-size: 12px;
   line-height: 1.5;
+  flex: 1;
+  min-width: 0;
 }
 .banner .badge {
   font-size: 10px;
@@ -256,12 +258,18 @@ body {
   font-weight: 800;
   padding: 2px 6px;
   border-radius: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .banner code {
   background: var(--bg);
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 11px;
+}
+/* 横幅正文次级行（一键安装说明等） */
+.banner .subtle {
+  opacity: 0.78;
 }
 .banner .btn-update {
   margin-left: auto;

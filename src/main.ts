@@ -93,6 +93,17 @@ function buildApp(): HTMLElement {
         </div>
       </div>
 
+      <div id="install-banner" class="card banner" style="display:none">
+        <div class="banner-row">
+          <span class="badge">未安装</span>
+          <div class="banner-body">
+            未检测到 dsh 环境<br />
+            <span class="subtle">点击一键安装，将执行 <code>npm install -g @deepseek-ai/dsh</code>（需已安装 Node.js）</span>
+          </div>
+          <button class="btn btn-update" id="btn-install">一键安装</button>
+        </div>
+      </div>
+
       <div id="update-banner" class="card banner" style="display:none">
         <div class="banner-row">
           <span class="badge">新版本</span>
@@ -259,6 +270,25 @@ function renderProxy(info: ProxyInfo) {
 /// 是否有更新正在进行（控制横幅按钮文案 / 禁用态）。
 let updating = false;
 
+/// 是否有安装任务正在进行（一键安装与一键更新共用进度事件通道，
+/// 两者横幅互斥展示——未安装时只显示安装横幅，装好有新版才显示更新横幅）。
+let installing = false;
+
+/// 安装横幅显隐。进行中（installing）时保持按钮的禁用与文案，避免状态轮询重置。
+function renderInstallBanner(visible: boolean) {
+  const banner = document.getElementById("install-banner")!;
+  if (!visible) {
+    banner.style.display = "none";
+    return;
+  }
+  banner.style.display = "";
+  const btn = document.getElementById("btn-install") as HTMLButtonElement;
+  if (!installing) {
+    btn.disabled = false;
+    btn.textContent = "一键安装";
+  }
+}
+
 function renderVersion(v: VersionInfo) {
   const banner = document.getElementById("update-banner")!;
   const body = document.getElementById("update-body")!;
@@ -310,11 +340,14 @@ function renderToken(token: string) {
 /// 刷新 dsh 入口来源显示（全局安装 / 本地安装 / 自定义路径 / 未找到）。
 /// 后端在 dsh 未运行时会按当前设置实时解析（可能涉及 npm root -g，秒级），
 /// 因此调用处不 await，避免阻塞页面初始化与事件绑定。
+/// 同时承担 dsh 环境检查：NotFound 时展示一键安装横幅，
+/// 该路径不受“自动检查更新”开关控制，面板每次打开都会执行。
 async function refreshResolution() {
   try {
     const r = await invoke<Resolution>("get_resolution");
     const src = document.getElementById("dsh-source");
     if (src) src.textContent = r.kind === "NotFound" ? "未找到 dsh" : r.source;
+    renderInstallBanner(r.kind === "NotFound");
   } catch { /* 忽略 */ }
 }
 
@@ -470,6 +503,28 @@ function bindEvents() {
     }
   });
 
+  document.getElementById("btn-install")!.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-install") as HTMLButtonElement;
+    if (installing || btn.disabled) return;
+    installing = true;
+    btn.disabled = true;
+    btn.textContent = "正在准备安装…";
+    try {
+      const v = await invoke<VersionInfo>("install_dsh");
+      renderVersion(v);
+      toast(v.installed ? `dsh v${v.installed} 已就绪` : "dsh 已就绪");
+      // 重新解析入口：横幅据此收起，来源标签同步为实际结果（如“全局安装”）。
+      await refreshResolution();
+      renderInstallBanner(false);
+    } catch (e) {
+      toast(`安装失败: ${e}`);
+      btn.disabled = false;
+      btn.textContent = "一键安装";
+    } finally {
+      installing = false;
+    }
+  });
+
   document.getElementById("proxy-toggle")!.addEventListener("change", (e) => {
     toggleProxy((e.target as HTMLInputElement).checked);
   });
@@ -545,10 +600,12 @@ async function listenEvents() {
     ["proxy-info", (e) => renderProxy(e.payload)],
     ["version-info", (e) => renderVersion(e.payload)],
     ["settings-changed", (e) => renderSettings(e.payload)],
-    // 一键更新阶段进度（后端文案直接显示在按钮上）。
+    // 一键安装 / 更新的阶段进度（后端文案直接显示在对应按钮上，按当前操作路由）。
     ["update-progress", (e) => {
-      const btn = document.getElementById("btn-update");
-      if (btn && e.payload?.message) btn.textContent = String(e.payload.message);
+      const msg = e.payload?.message;
+      if (!msg) return;
+      const btn = document.getElementById(installing ? "btn-install" : "btn-update");
+      if (btn) btn.textContent = String(msg);
     }],
   ];
   for (const [event, handler] of subs) {

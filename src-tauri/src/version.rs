@@ -11,7 +11,8 @@ use crate::APP_HANDLE;
 const REGISTRY_LATEST: &str = "https://registry.npmjs.org/@deepseek-ai%2Fdsh/latest";
 const PKG_SPEC: &str = "@deepseek-ai/dsh@latest";
 
-/// 一键更新防重入标志：npm 安装可达分钟级，期间禁止重复触发。
+/// 一键安装 / 一键更新共用的防重入标志：两者都是分钟级的 `npm install -g`，
+/// 并发执行会互相破坏（npm 全局目录锁、进度文案错乱）。
 static UPDATING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
@@ -127,11 +128,39 @@ pub async fn update_dsh(
     state: tauri::State<'_, DshState>,
 ) -> Result<DshVersion, String> {
     if UPDATING.swap(true, Ordering::SeqCst) {
-        return Err("已有更新正在进行，请稍候".into());
+        return Err("已有安装或更新任务正在进行，请稍候".into());
     }
     let result = run_update(&handle, &state).await;
     UPDATING.store(false, Ordering::SeqCst);
     result
+}
+
+/// 提取 npm stderr 的末尾片段（最多 200 字符）拼进错误信息——npm 报错的关键行在尾部。
+fn stderr_tail(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let tail: String = text.chars().rev().take(200).collect();
+    tail.chars().rev().collect()
+}
+
+/// 执行 `npm install -g @deepseek-ai/dsh@latest`（10 分钟超时）。
+/// 供一键更新与一键安装共用；进度文案由调用方负责推送。
+async fn npm_install_global(npm: &std::path::Path) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new(npm);
+    cmd.args(["install", "-g", PKG_SPEC])
+        .stdin(std::process::Stdio::null());
+    // GUI 子系统拉起 npm.cmd 必须隐藏终端窗口。
+    #[cfg(windows)]
+    cmd.creation_flags(process::CREATE_NO_WINDOW);
+
+    let output = tokio::time::timeout(Duration::from_secs(600), cmd.output())
+        .await
+        .map_err(|_| "npm 安装超时（10 分钟），请检查网络后重试".to_string())?
+        .map_err(|e| format!("执行 npm 失败：{e}"))?;
+
+    if !output.status.success() {
+        return Err(format!("npm 安装失败：{}", stderr_tail(&output)));
+    }
+    Ok(())
 }
 
 async fn run_update(
@@ -164,28 +193,13 @@ async fn run_update(
     }
 
     emit_progress(handle, "正在下载并安装新版本…");
-    let mut cmd = tokio::process::Command::new(&npm);
-    cmd.args(["install", "-g", PKG_SPEC])
-        .stdin(std::process::Stdio::null());
-    // GUI 子系统拉起 npm.cmd 必须隐藏终端窗口。
-    #[cfg(windows)]
-    cmd.creation_flags(process::CREATE_NO_WINDOW);
-
-    let output = tokio::time::timeout(Duration::from_secs(600), cmd.output())
-        .await
-        .map_err(|_| "npm 安装超时（10 分钟），请检查网络后重试".to_string())?
-        .map_err(|e| format!("执行 npm 失败：{e}"))?;
-
-    if !output.status.success() {
+    let installed = npm_install_global(&npm).await;
+    if installed.is_err() && was_running {
         // npm 安装失败时旧包通常完好，尽量恢复 dsh 运行。
-        if was_running {
-            emit_progress(handle, "安装失败，正在恢复 dsh…");
-            let _ = process::start_dsh(handle.clone(), state.clone()).await;
-        }
-        let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let tail: String = text.chars().rev().take(200).collect();
-        return Err(format!("npm 安装失败：{}", tail.chars().rev().collect::<String>()));
+        emit_progress(handle, "安装失败，正在恢复 dsh…");
+        let _ = process::start_dsh(handle.clone(), state.clone()).await;
     }
+    installed?;
 
     if was_running {
         emit_progress(handle, "正在以新版本重启 dsh…");
@@ -200,6 +214,82 @@ async fn run_update(
     let _ = handle.emit("version-info", info.clone());
     if let Some(main) = APP_HANDLE.get() {
         crate::tray::set_update_badge(main, info.update_available);
+    }
+    Ok(info)
+}
+
+/// 一键安装前的环境检查，返回可用的 npm 路径。dsh 经 npm 分发，
+/// 机器上必须先有 node / npm；缺失时给出可操作的指引而非笼统报错
+/// （node/npm 查找是纯文件系统探测，同步执行即可）。
+fn resolve_npm_for_install() -> Result<std::path::PathBuf, String> {
+    if process::node_exe().is_none() {
+        return Err(
+            "未找到 Node.js。dsh 通过 npm 分发，请先安装 Node.js（https://nodejs.org），完成后回到本面板重试".into(),
+        );
+    }
+    process::npm_exe().ok_or_else(|| {
+        "未找到 npm。请确认 Node.js 已完整安装（含 npm）后重试，或手动运行 npm install -g @deepseek-ai/dsh".into()
+    })
+}
+
+/// 一键安装：机器上找不到 dsh 时执行 `npm install -g @deepseek-ai/dsh@latest`，
+/// 成功后刷新版本信息与托盘徽标；若启用了“启动时自动运行 dsh”则随即拉起服务。
+#[tauri::command]
+pub async fn install_dsh(
+    handle: AppHandle,
+    state: tauri::State<'_, DshState>,
+) -> Result<DshVersion, String> {
+    if UPDATING.swap(true, Ordering::SeqCst) {
+        return Err("已有安装或更新任务正在进行，请稍候".into());
+    }
+    let result = run_install(&handle, &state).await;
+    UPDATING.store(false, Ordering::SeqCst);
+    result
+}
+
+async fn run_install(
+    handle: &AppHandle,
+    state: &tauri::State<'_, DshState>,
+) -> Result<DshVersion, String> {
+    let settings = settings::current(handle);
+
+    // 幂等保护：已能解析到 dsh 就不再跑 npm（用户可能在点击前配置了自定义路径、
+    // 或环境刚被外部装好），直接按“已是当前状态”返回当前信息供前端收起横幅。
+    if !matches!(
+        process::resolve_dsh(&settings.dsh_custom_path).await,
+        Resolution::NotFound { .. }
+    ) {
+        let info = gather(handle).await;
+        let _ = handle.emit("version-info", info.clone());
+        return Ok(info);
+    }
+
+    let npm = resolve_npm_for_install()?;
+
+    emit_progress(handle, "正在下载并安装 dsh…");
+    npm_install_global(&npm).await?;
+
+    emit_progress(handle, "正在确认安装结果…");
+    let info = gather(handle).await;
+    if info.installed.is_none() {
+        // npm 报成功却仍解析不到：多为全局 prefix 指向非常规目录等环境问题，
+        // 如实告知比让横幅永远挂着更好。
+        return Err(
+            "npm 已执行成功，但仍未定位到已安装的 dsh；请重启应用重试，或检查 npm 全局目录（npm root -g）".into(),
+        );
+    }
+    let _ = handle.emit("version-info", info.clone());
+    if let Some(main) = APP_HANDLE.get() {
+        crate::tray::set_update_badge(main, info.update_available);
+    }
+
+    // 与开机自启同一开关语义：允许自动运行则装完立即拉起。启动失败不算安装失败
+    // （包已就位），记日志即可，面板的未运行状态会引导用户手动启动看具体错误。
+    if settings.auto_start_dsh {
+        emit_progress(handle, "正在启动 dsh…");
+        if let Err(e) = process::start_dsh(handle.clone(), state.clone()).await {
+            log::warn!("安装后自动启动 dsh 失败：{e}");
+        }
     }
     Ok(info)
 }

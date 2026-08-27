@@ -166,7 +166,8 @@ fn global_node_modules() -> Option<PathBuf> {
     Some(PathBuf::from(line))
 }
 
-fn node_exe() -> Option<PathBuf> {
+/// 解析系统中的 node 可执行文件路径（供 version::install_dsh 做安装前环境检查）。
+pub(crate) fn node_exe() -> Option<PathBuf> {
     which::which("node").ok().or_else(|| which::which("node.exe").ok())
 }
 

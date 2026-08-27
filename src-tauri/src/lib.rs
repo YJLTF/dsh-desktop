@@ -320,6 +320,7 @@ pub fn run() {
             // 版本
             version::check_for_updates,
             version::update_dsh,
+            version::install_dsh,
             // 代理
             proxy::start_proxy,
             proxy::stop_proxy,
