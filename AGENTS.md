@@ -21,7 +21,7 @@ DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [RE
   - `lib.rs` —— 应用引导、Tauri 命令、受管状态、全局 `APP_HANDLE`、Harness 窗口管理。
   - `process.rs` —— 发现并拉起 `@deepseek-ai/dsh`（`dsh web`）、健康探测、遗留进程清理。
   - `proxy.rs` —— 局域网反向代理（axum）：HTTP + WebSocket 双向隧道、令牌鉴权（cookie / 查询参数）、端口回退。
-  - `version.rs` —— npm 仓库版本检查（`semver` 比较）、定时与按需检查、托盘徽标联动。
+  - `version.rs` —— npm 仓库版本检查（`semver` 比较）、定时与按需检查、托盘徽标联动、一键安装 / 一键更新。
   - `tray.rs` —— 系统托盘图标及右键菜单、更新徽标图标切换。
   - `settings.rs` —— 存放于用户配置目录的 JSON 配置（`settings::SettingsState`），损坏时备份 `.bak` 回退默认。
   - `autostart.rs` —— 开机自启动（HKCU Run 注册表，经 `reg.exe` 实现，无额外 crate 依赖）。
@@ -71,10 +71,11 @@ DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [RE
 - **前端 init 逐项容错**：单项 `invoke` 失败不应中断初始化（否则事件监听挂不上、页面假死）；新增初始化调用保持 try/catch 包裹。
 - **`Settings` 结构变更**：新字段必须加 `#[serde(default ...)]` 并同步 `Default` 实现、前端 `Settings` 接口与 `collectSettings`，否则旧配置文件反序列化失败会触发 `.bak` 备份回退。
 
-### dsh 一键更新（version.rs::update_dsh）
-- **仅支持"全局安装"来源**：自定义路径 / 本地 node_modules（安装目录可能不可写，或不在 npm 管辖内）会拒绝并提示手动升级，判定依据是 `Resolution.source == "全局安装"`。
-- **更新流程**：停 dsh（若运行中）→ `npm install -g @deepseek-ai/dsh@latest`（CREATE_NO_WINDOW、10 分钟超时）→ 恢复运行 → `gather()` 刷新横幅与托盘徽标；npm 失败时旧包通常完好，尽量恢复旧版运行后再报错。
-- **防重入**：`UPDATING` AtomicBool（npm 安装可达分钟级）；阶段进度经 `update-progress` 事件推送，message 直接用作前端按钮文案。
+### dsh 一键更新与一键安装（version.rs）
+- **仅支持"全局安装"来源**（一键更新）：自定义路径 / 本地 node_modules（安装目录可能不可写，或不在 npm 管辖内）会拒绝并提示手动升级，判定依据是 `Resolution.source == "全局安装"`。
+- **更新流程**：停 dsh（若运行中）→ `npm install -g @deepseek-ai/dsh@latest`（CREATE_NO_WINDOW、10 分钟超时）→ 恢复运行 → `gather()` 刷新横幅与托盘徽标；npm 失败时旧包通常完好，尽量恢复旧版运行后再报错。npm 调用本体抽在 `npm_install_global`，安装 / 更新共用。
+- **防重入**：`UPDATING` AtomicBool（npm 安装可达分钟级），一键安装 `install_dsh` 与一键更新共用该标志；阶段进度经 `update-progress` 事件推送，message 直接用作前端按钮文案——前端按 `installing` 标志把消息路由到“一键安装”或“立即更新”按钮（两个横幅互斥展示，不会同时活动）。
+- **一键安装（install_dsh）**：`get_resolution` 返回 NotFound 时前端横幅提供入口（不受“自动检查更新”开关控制）。后端先做 node/npm 环境检查（`resolve_npm_for_install`，缺失时给出 Node.js 安装指引）；已能解析到 dsh 时空转幂等返回当前信息；装好后刷新版本信息与托盘徽标，并在 `auto_start_dsh` 开启时拉起服务（启动失败仅记日志，不算安装失败）。
 
 ### 其他
 - **CSP 已收紧**（`tauri.conf.json`）：新增需要外部连接/内联脚本的功能时须同步调整 `security.csp`。
