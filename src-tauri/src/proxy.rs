@@ -39,6 +39,10 @@ struct ProxyState {
     target: Arc<String>,
     token: Arc<String>,
     client: reqwest::Client,
+    /// 应用句柄：读取 DshState 中 dsh web 的 launch token（dsh 0.1.2+ 认证用）。
+    handle: AppHandle,
+    /// 上游 dsh web 的浏览器会话 cookie（`name=value`，经 launch token 换取）。
+    dsh_cookie: Arc<Mutex<Option<String>>>,
 }
 
 /// 跟踪运行中的代理服务，便于在关闭开关时拆除。
@@ -190,6 +194,78 @@ fn make_cookie_header(token: &str) -> HeaderValue {
     .unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
+/// 从转发路径中剥掉与局域网令牌相同的 `token` 查询参数。
+/// 该参数只用于代理本地鉴权，不应透传上游：dsh 0.1.2 起把 `token` 查询参数
+/// 当作浏览器认证 launch token 校验，值不匹配会被 401 拒绝。
+fn strip_local_token(path_and_query: &str, token: &str) -> String {
+    let Some((path, query)) = path_and_query.split_once('?') else {
+        return path_and_query.to_string();
+    };
+    let parts: Vec<&str> = query.split('&').collect();
+    let needle = format!("token={token}");
+    let kept: Vec<&str> = parts.iter().copied().filter(|p| *p != needle).collect();
+    if kept.len() == parts.len() {
+        return path_and_query.to_string();
+    }
+    if kept.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{}", kept.join("&"))
+    }
+}
+
+/// 合并客户端 cookie 与上游 dsh 会话 cookie（后附加者供上游认证使用）。
+fn merge_cookies(client: Option<&str>, dsh: Option<&str>) -> Option<String> {
+    match (client, dsh) {
+        (Some(c), Some(d)) => Some(format!("{c}; {d}")),
+        (Some(c), None) => Some(c.to_string()),
+        (None, Some(d)) => Some(d.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// 读取 dsh web 的 launch token（dsh 0.1.2+ 才会经 stdout 报出，否则 None）。
+async fn dsh_launch_token(handle: &AppHandle) -> Option<String> {
+    handle
+        .state::<crate::process::DshState>()
+        .launch_token()
+        .await
+}
+
+/// 用 dsh web 的 launch token 换取浏览器会话 cookie（`name=value`）。
+///
+/// dsh 0.1.2 起 web 端点要求认证：`GET /?token=<launch token>` 换取绑定
+/// Host authority 的 30 天签名 cookie，其余请求一律 401。代理转发统一把
+/// Host 头改写为上游 authority，因此一枚 cookie 即可用于所有经代理请求
+/// （HTTP 与 WebSocket 握手）。cookie 的签名密钥按 dsh home 持久化，
+/// 跨 dsh 进程重启仍有效；dsh 无认证（旧版）或 token 尚未捕获时不做任何请求。
+async fn ensure_dsh_cookie(state: &ProxyState) -> Option<String> {
+    if let Some(c) = state.dsh_cookie.lock().await.clone() {
+        return Some(c);
+    }
+    let token = dsh_launch_token(&state.handle).await?;
+    let url = format!("{}/?token={}", state.target, token);
+    let resp = state
+        .client
+        .get(&url)
+        // 换取的 cookie 绑定 Host authority，必须与后续转发使用的 Host 一致。
+        .header("host", upstream_authority(&state.target))
+        .send()
+        .await
+        .ok()?;
+    // 成功换取时响应为 303，set-cookie 携带唯一一枚认证 cookie
+    //（dsh 侧名称形如 `dsh-auth-<authority 哈希>`），取 name=value 部分。
+    let cookie = resp.headers().get_all(reqwest::header::SET_COOKIE).iter().find_map(|v| {
+        let s = v.to_str().ok()?;
+        let pair = s.split(';').next()?.trim();
+        pair.contains('=').then(|| pair.to_string())
+    });
+    if let Some(c) = &cookie {
+        *state.dsh_cookie.lock().await = Some(c.clone());
+    }
+    cookie
+}
+
 /// 令牌缺失或无效时返回的最小 HTML 页面。
 fn unauthorized_html() -> Response {
     let body = r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>未授权</title></head>
@@ -271,20 +347,24 @@ async fn proxy_handler(
         return unauthorized_html();
     }
 
-    let path = uri
+    let raw_path = uri
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
+    let path = strip_local_token(&raw_path, &state.token);
+
+    // dsh 0.1.2+ 浏览器认证：有 launch token 时先确保持有上游会话 cookie
+    //（首次调用会同步完成一次换取，之后走缓存）。
+    let dsh_cookie = ensure_dsh_cookie(&state).await;
 
     // 是否为 WebSocket 升级请求？
     if let Some(ws) = ws_upgrade {
         let state = state.clone();
-        let path = path.clone();
-        return ws.on_upgrade(move |socket| forward_ws(socket, state, path));
+        return ws.on_upgrade(move |socket| forward_ws(socket, state, path, dsh_cookie));
     }
 
     // 普通 HTTP 转发。
-    let mut resp = match forward_http(state.clone(), path, req).await {
+    let mut resp = match forward_http(state.clone(), path, req, dsh_cookie).await {
         Ok(r) => r,
         Err(e) => {
             log::error!("代理转发出错：{e}");
@@ -308,13 +388,14 @@ fn upstream_authority(target: &str) -> &str {
     target.trim_start_matches("http://").trim_start_matches("https://")
 }
 
-/// 将普通 HTTP 请求转发至上游并以流的方式回传响应。
-async fn forward_http(
-    state: ProxyState,
-    path: String,
-    req: Request,
-) -> Result<Response, Box<dyn std::error::Error>> {
-    let (parts, body) = req.into_parts();
+/// 构造并向 dsh 上游发出一次 HTTP 请求，返回上游响应（不消费响应体）。
+async fn send_upstream(
+    state: &ProxyState,
+    parts: &axum::http::request::Parts,
+    path: &str,
+    body: Option<reqwest::Body>,
+    dsh_cookie: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
     let url = format!("{}{}", state.target, path);
 
     let mut upstream_req = state.client.request(parts.method.clone(), &url);
@@ -322,6 +403,7 @@ async fn forward_http(
     // 自身源不同，原样转发会被 403 拒绝（POST /api/* 全挂）。改写为上游源即可
     // 与直连访问等价；referer 同理剥离，上游不依赖它。
     let had_origin = parts.headers.contains_key("origin");
+    let mut client_cookie: Option<String> = None;
     for (name, value) in parts.headers.iter() {
         if is_hop(name.as_str()) {
             continue;
@@ -332,6 +414,13 @@ async fn forward_http(
             continue;
         }
         if name.as_str() == "origin" || name.as_str() == "referer" {
+            continue;
+        }
+        // cookie 单独合并：客户端 cookie 保留，追加 dsh 会话 cookie 供上游认证。
+        if name.as_str() == "cookie" {
+            if let Ok(s) = value.to_str() {
+                client_cookie = Some(s.to_string());
+            }
             continue;
         }
         upstream_req = upstream_req.header(name, value);
@@ -345,26 +434,73 @@ async fn forward_http(
     if had_origin {
         upstream_req = upstream_req.header("origin", state.target.as_str());
     }
+    if let Some(cookie) = merge_cookies(client_cookie.as_deref(), dsh_cookie) {
+        upstream_req = upstream_req.header("cookie", cookie);
+    }
     // 流式透传请求体：整体缓冲会让大附件上传时代理内存峰值与请求体等大。
     // GET/HEAD 按 HTTP 语义不带请求体，跳过（分块空体会让部分服务端拒绝）。
-    if !matches!(parts.method.as_str(), "GET" | "HEAD") {
+    if let Some(body) = body {
+        upstream_req = upstream_req.body(body);
+    }
+    Ok(upstream_req.send().await?)
+}
+
+/// 将普通 HTTP 请求转发至上游并以流的方式回传响应。
+async fn forward_http(
+    state: ProxyState,
+    path: String,
+    req: Request,
+    dsh_cookie: Option<String>,
+) -> Result<Response, Box<dyn std::error::Error>> {
+    let (parts, body) = req.into_parts();
+    let bodyless = matches!(parts.method.as_str(), "GET" | "HEAD");
+    let upstream_body = if bodyless {
+        None
+    } else {
         // BodyStream 产出的是 http_body 帧（数据/尾随帧），须解包为纯字节流。
         let stream = http_body_util::BodyStream::new(body)
             .map(|res| res.map(|frame| frame.into_data().unwrap_or_default()));
-        upstream_req = upstream_req.body(reqwest::Body::wrap_stream(stream));
+        Some(reqwest::Body::wrap_stream(stream))
+    };
+
+    let mut resp = send_upstream(
+        &state,
+        &parts,
+        &path,
+        upstream_body,
+        dsh_cookie.as_deref(),
+    )
+    .await?;
+
+    // 上游 401 说明缺少或持有失效的 dsh 会话 cookie（dsh 重置凭据 / 升级前后
+    // 衔接 / launch token 尚未捕获）：丢弃旧 cookie，token 已就绪时无体请求
+    //（GET/HEAD——index 与静态资源，401 最常落在它们身上）换新 cookie 立即
+    // 重试；有体请求无法重放，仅后台重铸供后续请求使用。
+    if resp.status() == StatusCode::UNAUTHORIZED {
+        *state.dsh_cookie.lock().await = None;
+        let can_mint = dsh_launch_token(&state.handle).await.is_some();
+        if bodyless && can_mint {
+            if let Some(fresh) = ensure_dsh_cookie(&state).await {
+                resp = send_upstream(&state, &parts, &path, None, Some(&fresh)).await?;
+            }
+        } else if can_mint {
+            let st = state.clone();
+            tokio::spawn(async move {
+                ensure_dsh_cookie(&st).await;
+            });
+        }
     }
 
-    let upstream_resp = upstream_req.send().await?;
-    let status = upstream_resp.status();
-    let is_html = is_plain_html(upstream_resp.headers());
+    let status = resp.status();
+    let is_html = is_plain_html(resp.headers());
     let mut builder = Response::builder().status(status.as_u16());
     if let Some(h) = builder.headers_mut() {
-        copy_headers(upstream_resp.headers(), h);
+        copy_headers(resp.headers(), h);
     }
 
     // HTML 文档需注入 secure-context 垫片，整包读出改写；其余响应一律流式透传。
     if is_html {
-        let bytes = upstream_resp.bytes().await?;
+        let bytes = resp.bytes().await?;
         let body = match inject_polyfill(&bytes) {
             Some(html) => Body::from(html),
             None => Body::from(bytes),
@@ -372,16 +508,32 @@ async fn forward_http(
         return Ok(builder.body(body)?);
     }
 
-    let stream = upstream_resp.bytes_stream();
+    let stream = resp.bytes_stream();
     let body = Body::from_stream(stream);
     Ok(builder.body(body)?)
 }
 
 /// 在浏览器与上游之间双向隧道化 WebSocket。
-async fn forward_ws(socket: WebSocket, state: ProxyState, path: String) {
+async fn forward_ws(socket: WebSocket, state: ProxyState, path: String, dsh_cookie: Option<String>) {
     let ws_url = format!("ws://{}{}", state.target.trim_start_matches("http://"), path);
 
-    let upstream = match tokio_tungstenite::connect_async(&ws_url).await {
+    // dsh 0.1.2+ 的 WebSocket 升级同样校验浏览器会话 cookie（绑定 Host
+    // authority；Host 由 URI 推导，与 HTTP 转发路径一致）。
+    let handshake = match ws_url.parse::<axum::http::Uri>() {
+        Ok(uri) => {
+            let mut builder = tungstenite::client::ClientRequestBuilder::new(uri);
+            if let Some(c) = &dsh_cookie {
+                builder = builder.with_header("cookie", c.clone());
+            }
+            builder
+        }
+        Err(e) => {
+            log::error!("代理：构造上游 WebSocket 握手失败 {ws_url}：{e}");
+            return;
+        }
+    };
+
+    let upstream = match tokio_tungstenite::connect_async(handshake).await {
         Ok((s, _)) => s,
         Err(e) => {
             log::error!("代理：连接上游 WebSocket 失败 {ws_url}：{e}");
@@ -522,6 +674,8 @@ pub async fn start_proxy(
             .timeout(Duration::from_secs(300))
             .build()
             .map_err(|e| format!("代理客户端构建失败：{e}"))?,
+        handle: handle.clone(),
+        dsh_cookie: Arc::new(Mutex::new(None)),
     };
 
     let (listener, bound_port) = bind_listener(port)
@@ -701,6 +855,41 @@ mod tests {
         assert_eq!(upstream_authority("http://127.0.0.1:3080"), "127.0.0.1:3080");
         assert_eq!(upstream_authority("https://example.com:9443"), "example.com:9443");
         assert_eq!(upstream_authority("127.0.0.1:3080"), "127.0.0.1:3080");
+    }
+
+    #[test]
+    fn strips_local_token_from_query() {
+        assert_eq!(strip_local_token("/?token=abc123", "abc123"), "/");
+        assert_eq!(
+            strip_local_token("/?token=abc123&foo=bar", "abc123"),
+            "/?foo=bar"
+        );
+        assert_eq!(
+            strip_local_token("/?foo=bar&token=abc123", "abc123"),
+            "/?foo=bar"
+        );
+        // 多个同名参数只剥与局域网令牌相同的那个。
+        assert_eq!(
+            strip_local_token("/?token=abc123&token=other", "abc123"),
+            "/?token=other"
+        );
+    }
+
+    #[test]
+    fn keeps_path_without_matching_token() {
+        assert_eq!(strip_local_token("/", "abc123"), "/");
+        assert_eq!(strip_local_token("/api/rpc?x=1", "abc123"), "/api/rpc?x=1");
+        // 值不同（例如 dsh 自身的 launch token 恰好被带上）不剥。
+        assert_eq!(strip_local_token("/?token=other", "abc123"), "/?token=other");
+        assert_eq!(strip_local_token("/x?token=", "abc123"), "/x?token=");
+    }
+
+    #[test]
+    fn merges_client_and_dsh_cookies() {
+        assert_eq!(merge_cookies(Some("a=1"), Some("dsh-auth-x=v1")).as_deref(), Some("a=1; dsh-auth-x=v1"));
+        assert_eq!(merge_cookies(Some("a=1"), None).as_deref(), Some("a=1"));
+        assert_eq!(merge_cookies(None, Some("dsh-auth-x=v1")).as_deref(), Some("dsh-auth-x=v1"));
+        assert_eq!(merge_cookies(None, None), None);
     }
 
     #[test]

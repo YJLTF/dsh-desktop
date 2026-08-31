@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -85,11 +86,34 @@ impl Default for Status {
 pub struct DshState {
     child: Arc<Mutex<Option<Child>>>,
     resolution: Mutex<Resolution>,
+    /// 当前 dsh 子进程的浏览器认证 launch token（dsh 0.1.2+ 经 stdout 报出）。
+    launch_token: Arc<Mutex<Option<String>>>,
+    /// harness-ui 窗口最近一次导航所用的 launch token（判断重新打开时是否需要带新 token 导航）。
+    harness_nav_token: Mutex<Option<String>>,
 }
 
 impl DshState {
     pub async fn resolution(&self) -> Resolution {
         self.resolution.lock().await.clone()
+    }
+
+    /// 当前记录的 dsh web launch token（无认证的旧版 dsh 为 None）。
+    pub async fn launch_token(&self) -> Option<String> {
+        self.launch_token.lock().await.clone()
+    }
+
+    /// harness-ui 窗口最近一次导航所用的 launch token。
+    pub async fn harness_nav_token(&self) -> Option<String> {
+        self.harness_nav_token.lock().await.clone()
+    }
+
+    pub async fn set_harness_nav_token(&self, token: Option<String>) {
+        *self.harness_nav_token.lock().await = token;
+    }
+
+    /// 丢弃已记录的 launch token（dsh 进程结束 / 重启后旧 token 不再有效）。
+    async fn clear_launch_token(&self) {
+        *self.launch_token.lock().await = None;
     }
 
     /// 同步判断 dsh 子进程是否存活（供托盘事件等同步上下文使用）。
@@ -379,6 +403,74 @@ pub async fn probe_server(host: &str, port: u16, timeout: Duration) -> bool {
     }
 }
 
+/// 从 `dsh web` 的 stdout 行中解析浏览器认证 launch token。
+///
+/// dsh-web-app 就绪后会打印一行启动 URL：
+/// `dsh web: http://127.0.0.1:3080/?token=<token> (LAN: http://192.168.x.x:3080/?token=<token>)`。
+/// 两处 URL 携带同一 token，取第一处即可。旧版 dsh 打印的 URL 不带 token，
+/// 以及 `dsh web: opening the default browser; ...` 之类的提示行均返回 None。
+fn parse_launch_token(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("dsh web:")?.trim_start();
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let url = url::Url::parse(&rest[..end]).ok()?;
+    url.query_pairs()
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.into_owned())
+}
+
+/// 持续读取 dsh 子进程的 stdout，把解析到的 launch token 写入共享槽位。
+/// 必须读到 EOF 为止：提前放弃读取会让管道缓冲区写满后阻塞 dsh 的 stdout 写入。
+async fn drain_dsh_stdout(stdout: tokio::process::ChildStdout, slot: Arc<Mutex<Option<String>>>) {
+    let mut lines = BufReader::new(stdout).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(token) = parse_launch_token(&line) {
+            let mut guard = slot.lock().await;
+            if guard.is_none() {
+                *guard = Some(token);
+            }
+        }
+    }
+}
+
+/// 等待 dsh web 的浏览器认证 launch token。
+///
+/// dsh 0.1.2 起 web 端点要求认证：首次须以 `?token=<launch token>` 访问 `/`
+/// 换取签名会话 cookie，否则一切请求（含 index 与 WebSocket）都被 401 拒绝。
+/// 先探测端点：不要求认证（旧版 dsh 返回 200）时无需等待，立即返回 None；
+/// 要求认证（401）则轮询 token 槽位直至 stdout 报出或超时。
+pub(crate) async fn wait_for_launch_token(
+    host: &str,
+    port: u16,
+    state: &DshState,
+    timeout: Duration,
+) -> Option<String> {
+    if let Some(t) = state.launch_token().await {
+        return Some(t);
+    }
+    let url = format!("http://{}:{}", host, port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    // 端点不要求认证时无需 token；探测本身失败（服务恰在重启空窗）按“要求
+    // 认证”处理，走轮询自然超时兜底。
+    if let Ok(resp) = client.get(&url).send().await {
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return None;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(t) = state.launch_token().await {
+            return Some(t);
+        }
+        if tokio::time::Instant::now() > deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 /// 清理占用指定端口的遗留 dsh 进程。
 /// 上次会话若被强杀（如任务管理器结束进程），dsh 子进程会残留并占用端口，
 /// 导致本次启动的新子进程因端口冲突静默退出。
@@ -524,7 +616,7 @@ pub async fn start_dsh(
     })?;
 
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
 
@@ -543,7 +635,14 @@ pub async fn start_dsh(
     #[cfg(windows)]
     cleanup_stale_port_owner(settings.dsh_port, stale_image.as_deref()).await;
 
-    let child = cmd.spawn().map_err(|e| format!("拉起 dsh 失败：{e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("拉起 dsh 失败：{e}"))?;
+
+    // 旧进程的 launch token 不再有效，先丢弃再由 stdout 读取任务写入新值。
+    state.clear_launch_token().await;
+    if let Some(stdout) = child.stdout.take() {
+        let slot = Arc::clone(&state.launch_token);
+        tokio::spawn(drain_dsh_stdout(stdout, slot));
+    }
 
     let child_handle = state.child.clone();
     {
@@ -569,17 +668,31 @@ pub async fn start_dsh(
         return Err("dsh 启动失败：进程已退出或服务未在规定时间内变为可达".into());
     }
 
-    // 若 Harness 窗口已打开且指向本服务，刷新它以重连新进程
-    // （重启后旧页面的 WebSocket / 会话已失效，不刷新会停留在过期状态）。
+    // dsh 0.1.2 起需要浏览器认证：等 launch token 从 stdout 报出后再刷新
+    // Harness 窗口（旧版 dsh 端点无需认证，探测到 200 即立即返回 None）。
+    let launch_token = wait_for_launch_token(&host, port, &state, Duration::from_secs(8)).await;
+
+    // 若 Harness 窗口已打开且指向本服务，重新导航以重连新进程
+    // （重启后旧页面的 WebSocket / 会话已失效，不导航会停留在过期状态）。
+    // 有新 token 时导航到 token URL 换取会话 cookie；无 token（旧版 dsh）则原地刷新。
     if let Some(w) = handle.get_webview_window("harness-ui") {
         let points_to_dsh = w
             .url()
             .map(|u| crate::url_points_to_dsh(&u, &host, port))
             .unwrap_or(false);
         if points_to_dsh {
-            let _ = w.eval("window.location.reload();");
+            match &launch_token {
+                Some(t) => {
+                    let token_url = format!("http://{}:{}/?token={}", host, port, t);
+                    let _ = w.eval(&format!("window.location.href = '{token_url}';"));
+                }
+                None => {
+                    let _ = w.eval("window.location.reload();");
+                }
+            }
         }
     }
+    state.set_harness_nav_token(launch_token).await;
 
     Ok(format!("http://{}:{}", host, port))
 }
@@ -596,6 +709,7 @@ pub async fn stop_dsh(
         let _ = child.wait().await;
     }
     drop(guard);
+    state.clear_launch_token().await;
     emit_status(&handle, false);
     Ok(())
 }
@@ -657,4 +771,40 @@ pub struct DshVersion {
     pub installed: Option<String>,
     pub latest: Option<String>,
     pub update_available: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_token_from_launch_url() {
+        let line = "dsh web: http://127.0.0.1:3080/?token=Ab12_-xz";
+        assert_eq!(parse_launch_token(line).as_deref(), Some("Ab12_-xz"));
+    }
+
+    #[test]
+    fn parses_token_with_lan_suffix() {
+        let line = "dsh web: http://127.0.0.1:3080/?token=Ab12_-xz (LAN: http://192.168.1.5:3080/?token=Ab12_-xz)";
+        assert_eq!(parse_launch_token(line).as_deref(), Some("Ab12_-xz"));
+    }
+
+    #[test]
+    fn ignores_old_format_without_token() {
+        // 0.1.1 及更早的 dsh 打印不带 token 的启动 URL。
+        assert_eq!(
+            parse_launch_token("dsh web: http://127.0.0.1:3080 (LAN: http://192.168.1.5:3080)"),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_non_url_hint_lines() {
+        // 旧版 dsh 在 URL 行之后还会打印浏览器拉起提示，前缀相同但不是 URL。
+        assert_eq!(
+            parse_launch_token("dsh web: opening the default browser; pass --no-open to disable"),
+            None
+        );
+        assert_eq!(parse_launch_token("listening on port 3080"), None);
+    }
 }
