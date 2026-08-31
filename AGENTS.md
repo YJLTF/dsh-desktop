@@ -55,6 +55,13 @@ DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [RE
 - **`npm root -g` 必须在 `spawn_blocking` 中执行**：npm 冷启动可达秒级，直接在 async 上下文调用会阻塞 tokio 工作线程。
 - **`dsh web` 以 `--no-open` 启动并按版本门控**：dsh 0.1.0-rc.8 起 `web` 启动后会自动打开系统浏览器，桌面端在 harness-ui 窗口内承载 UI，`start_dsh` 会传 `--no-open` 阻止。该选项旧版不存在，commander 收到未知选项直接 exit 1（启动整体失败），故 `supports_no_open` 按已装版本（≥ 0.1.0-rc.8）判断后才传递；版本探测走 package.json 快路径，自定义可执行文件退回 `<入口> --version` 子进程。
 
+### dsh web 浏览器认证（launch token，process.rs / lib.rs / proxy.rs）
+- **dsh 0.1.2 起 `dsh web` 强制浏览器认证**：每次启动随机生成 launch token，经 stdout 打印 `dsh web: http://127.0.0.1:<port>/?token=<token>`；首次 `GET /` 携带正确 token 会 303 到干净 `/` 并种下**绑定 Host authority** 的 30 天签名 cookie（`dsh-auth-<sha256(authority)>`），其余一切请求（index、`/api`、WebSocket 升级）无有效 cookie 一律 401（即用户看到的 "dsh web authentication required; reopen the URL printed by dsh web"）。cookie 签名密钥按 dsh home 持久化，**跨 dsh 进程重启有效**；错误 token 或不匹配的 authority 同样 401。旧版 dsh（≤ 0.1.1）无此机制，裸 `GET /` 返回 200 可直接区分，无需按版本号门控。
+- **launch token 靠 stdout 捕获**：`start_dsh` 把 stdout 置为 piped，`drain_dsh_stdout` 常驻读取到 EOF（**提前放弃读取会让管道写满、阻塞 dsh 的 stdout 写入**），`parse_launch_token` 按 `dsh web: ` 前缀解析首个 URL 的 `token` 参数。token 存于 `DshState::launch_token`，dsh 停止 / 重新拉起时清空。**不要把 stdout 改回 `Stdio::null()`**，否则认证版 dsh 无法进入 Harness。
+- **Harness 窗口导航必须带 token**：`open_harness_window_checked` / `start_dsh` 刷新路径在 token 存在时导航到 `?token=<token>`（由 WebView 完成换 cookie），无 token 才退回裸 URL / `location.reload()`。`wait_for_launch_token` 先探测端点——非 401（旧版 dsh）立即跳过等待；401（含刚拉起、announce 未打印）则轮询 token 槽位（8 秒上限）。`DshState::harness_nav_token` 记录窗口最近一次导航所用 token，托盘重复打开时 token 未变则不重载（避免打断活跃会话）。
+- **代理须自行持有 dsh 会话 cookie**：`ensure_dsh_cookie` 用 launch token 换 cookie 并缓存（`ProxyState.dsh_cookie`）。**换取时的 `Host` 头必须与后续转发一致**（都用 `upstream_authority(target)`，cookie 按 authority 绑定校验）；HTTP 转发将客户端 cookie 与 dsh cookie 合并（`merge_cookies`），WebSocket 握手经 `ClientRequestBuilder` 附带同一枚 cookie。上游 401 时清缓存重铸：GET/HEAD 换新 cookie 立即重试，有体请求无法重放、仅后台重铸。
+- **转发前必须剥掉与局域网令牌相同的 `token` 查询参数**（`strip_local_token`）：dsh 会把 `?token=` 当作 launch token 校验，原样透传代理令牌会因不匹配被 401（首次打开 `http://<内网IP>:<端口>/?token=<代理令牌>` 即复现）。
+
 ### 代理模块（proxy.rs）
 - **启停必须持 `ProxyRuntime::op_lock`**：开机自动恢复与用户手动开关可能并发，分段锁（shutdown/join）会造成双绑定。新增修改代理生命周期的命令时先取该锁。
 - **端口可能回退**：Win10 上 Hyper-V/WSL/VPN 会随机保留端口段（bind 报 WSAEACCES 10013），`bind_listener` 失败重试后回退系统分配端口。因此**实际监听端口以 `ProxyRuntime::port` 记录为准**，`get_proxy_info` 已按此回报；不要假设监听端口等于 `settings.lan_proxy_port`。
@@ -81,5 +88,5 @@ DSH Desktop（dsh-desktop）的开发指南与注意事项。功能特性见 [RE
 - **CSP 已收紧**（`tauri.conf.json`）：新增需要外部连接/内联脚本的功能时须同步调整 `security.csp`。
 - **退出清理**：`RunEvent::Exit` 中调用 `DshState::shutdown_blocking()` 结束 dsh 子进程；`app.exit()` 不执行受管状态析构，删掉该钩子会遗留孤儿 node 进程占用端口。
 - **遗留进程清理只杀白名单映像**（node / 解析出的自定义可执行文件名），避免误杀无关服务；扩展启动方式时同步更新 `kill_if_stale`。
-- **dsh 重启后刷新 Harness 窗口**：`start_dsh` 成功且 `harness-ui` 指向本服务时会 `location.reload()`，旧页面的 WebSocket / 会话已失效，不要移除该刷新。
+- **dsh 重启后刷新 Harness 窗口**：`start_dsh` 成功且 `harness-ui` 指向本服务时会重新导航（有 launch token 时导航到 token URL 换新会话 cookie，无则 `location.reload()`），旧页面的 WebSocket / 会话已失效，不要移除该刷新。
 - **托盘左键行为依赖 dsh 运行状态**（运行中开 Harness / 未运行唤起控制面板），通过 `DshState::is_running()` 同步判断。

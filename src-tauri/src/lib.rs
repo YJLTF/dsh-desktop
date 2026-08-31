@@ -72,11 +72,11 @@ pub fn url_points_to_dsh(current: &url::Url, dsh_host: &str, dsh_port: u16) -> b
 /// 若在服务未就绪时导航，WebView2 会停留在连接错误页（表现为白屏）且不会自动重试。
 pub async fn open_harness_window_checked(handle: &AppHandle) {
     let s = settings::current(handle);
-    let dsh_url = format!("http://{}:{}", s.dsh_host, s.dsh_port);
+    let dsh_state = handle.state::<process::DshState>();
 
     // 等待服务就绪（最长约 10 秒），避免撞上启动 / 重启空窗期。
     if !process::probe_server(&s.dsh_host, s.dsh_port, std::time::Duration::from_secs(10)).await {
-        log::warn!("无法打开 Harness 窗口：dsh 服务未就绪（{dsh_url}）");
+        log::warn!("无法打开 Harness 窗口：dsh 服务未就绪（http://{}:{}）", s.dsh_host, s.dsh_port);
         let _ = notify(
             "无法打开 Harness 界面",
             "dsh 服务未就绪，请稍后重试或先在控制面板启动 dsh",
@@ -84,14 +84,32 @@ pub async fn open_harness_window_checked(handle: &AppHandle) {
         return;
     }
 
+    // dsh 0.1.2 起 web 端点要求浏览器认证：首次须以 `?token=<launch token>`
+    // 访问 `/` 换取签名会话 cookie，否则整页 401（提示 reopen the URL printed
+    // by dsh web）。刚拉起的进程等 token 从 stdout 报出；旧版 dsh 无需认证，
+    // 探测到端点 200 即立即返回 None。
+    let launch_token = process::wait_for_launch_token(
+        &s.dsh_host,
+        s.dsh_port,
+        dsh_state.inner(),
+        std::time::Duration::from_secs(8),
+    )
+    .await;
+    let dsh_url = match &launch_token {
+        Some(t) => format!("http://{}:{}/?token={}", s.dsh_host, s.dsh_port, t),
+        None => format!("http://{}:{}", s.dsh_host, s.dsh_port),
+    };
+
     if let Some(w) = handle.get_webview_window("harness-ui") {
-        // 窗口已存在：若页面停留在错误页或地址不符，重新导航后再显示。
-        let needs_nav = w
+        // 窗口已存在：页面停留在错误页 / 地址不符 / dsh 已换新 token 时重新导航。
+        let points_to_dsh = w
             .url()
-            .map(|u| !url_points_to_dsh(&u, &s.dsh_host, s.dsh_port))
+            .map(|u| url_points_to_dsh(&u, &s.dsh_host, s.dsh_port))
             .unwrap_or(true);
-        if needs_nav {
+        let token_current = dsh_state.harness_nav_token().await == launch_token;
+        if !points_to_dsh || !token_current {
             let _ = w.eval(&format!("window.location.href = '{dsh_url}';"));
+            dsh_state.set_harness_nav_token(launch_token.clone()).await;
         }
         // Windows 上最小化的窗口 show() 是空操作，须先 unminimize 才能还原。
         let _ = w.unminimize();
@@ -124,6 +142,7 @@ pub async fn open_harness_window_checked(handle: &AppHandle) {
             // 用 eval 再触发一次导航：部分 WebView2 环境下首次 External 加载会黑屏，
             // 二次导航可强制渲染。
             let _ = w.eval(&format!("window.location.href = '{dsh_url}';"));
+            dsh_state.set_harness_nav_token(launch_token).await;
             hide_control_panel(handle);
         }
         Err(e) => {
